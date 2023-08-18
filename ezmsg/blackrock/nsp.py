@@ -1,3 +1,6 @@
+from dataclasses import dataclass
+
+import asyncio
 import typing
 
 import numpy as np
@@ -6,6 +9,13 @@ import ezmsg.core as ez
 from pycbsdk import cbsdk
 
 from ezmsg.util.messages.axisarray import AxisArray
+
+# TODO: This probably needs to be part of a larger spike signal processing library
+@dataclass
+class SpikeEvent:
+    channel: str
+    timestamp: float
+    id: int
 
 class NSPSourceSettings(ez.Settings):
     inst_addr: str = ""
@@ -17,29 +27,42 @@ class NSPSourceSettings(ez.Settings):
 
 class NSPSourceState(ez.State):
     device: cbsdk.NSPDevice
+    spike_queue: asyncio.Queue[SpikeEvent]
 
 class NSPSource(ez.Unit):
     SETTINGS: NSPSourceSettings
     STATE: NSPSourceState
     
-    OUTPUT = ez.OutputStream(AxisArray)
+    OUTPUT_SPIKE = ez.OutputStream(SpikeEvent)
 
     async def initialize(self) -> None:
+
+        self.STATE.spike_queue = asyncio.Queue()
         
-        self.STATE.device = cbsdk.NSPDevice(
-            cbsdk.Params(
-                inst_addr = self.SETTINGS.inst_addr, 
-                inst_port = self.SETTINGS.inst_port, 
-                client_addr = self.SETTINGS.client_addr, 
-                client_port = self.SETTINGS.client_port, 
-                recv_bufsize = self.SETTINGS.recv_bufsize, 
-                protocol = self.SETTINGS.protocol
+        params = cbsdk.create_params(**vars(self.SETTINGS))
+        self.STATE.device = cbsdk.NSPDevice(params)
+        run_level = self.STATE.device.connect(startup_sequence = False)
+
+        if not run_level:
+            raise ValueError(f"Failed to connect to NSP; {params=}")
+
+        _ = cbsdk.register_spk_callback(self.STATE.device, self.on_spike) # type: ignore
+
+    def shutdown(self) -> None:
+        self.STATE.device.disconnect()
+
+    def on_spike(self, spk_pkt):
+        self.STATE.spike_queue.put_nowait(
+            SpikeEvent(
+                channel = spk_pkt.header.chid, 
+                timestamp = spk_pkt.header.time, 
+                id = 0
             )
         )
-        self.STATE.device.connect(startup_sequence = False)
 
-    @ez.publisher(OUTPUT)
-    async def continuous(self) -> typing.AsyncGenerator:
-        msg = AxisArray(np.ones(5), dims = ['time'])
-        yield self.OUTPUT, msg
+    @ez.publisher(OUTPUT_SPIKE)
+    async def spikes(self) -> typing.AsyncGenerator:
+        while True:
+            spike_event = await self.STATE.spike_queue.get()
+            yield self.OUTPUT_SPIKE, spike_event
 

@@ -2,6 +2,8 @@
 
 Interface for Blackrock Cerebus ecosystem (incl. Neuroport) using `pycbsdk`
 
+NOTE: Currently only supports spikes, but a PR for continuous data as `ezmsg.util.messages.axisarray.AxisArray` wouldn't be a heavy lift and a readily accepted PR :D
+
 ## Installation
 `pip install ezmsg-blackrock@git+https://github.com/griffinmilsap/ezmsg-blackrock`
 

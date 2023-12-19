@@ -1,14 +1,13 @@
 from dataclasses import dataclass
-
 import asyncio
 import typing
 
 import numpy as np
-import ezmsg.core as ez
-
 from pycbsdk import cbsdk
 
+import ezmsg.core as ez
 from ezmsg.util.messages.axisarray import AxisArray
+
 
 # TODO: This probably needs to be part of a larger spike signal processing library
 @dataclass
@@ -65,4 +64,3 @@ class NSPSource(ez.Unit):
         while True:
             spike_event = await self.STATE.spike_queue.get()
             yield self.OUTPUT_SPIKE, spike_event
-

@@ -11,7 +11,7 @@ packages = [
 
 
 [tool.poetry.dependencies]
-python = "^3.8
+python = "^3.8"
 ezmsg = "^3.3.3"
 pycbsdk = "^0.1.3"
 

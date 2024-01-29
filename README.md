@@ -53,13 +53,18 @@ It is possible to emulate Blackrock hardware while playing back previously recor
 The publicly-available and supported nPlayServer is only available on Windows but unsupported Mac and Linux binaries (x86 or ARM) are available. Open an issue to ask.  
 
 1. Power down the NSP if you already have it on the switch/router.
-1. Reconfigure the emulation host PC to have an IP address matching the emulated device (see addresses listed above).
 1. Download and extract the "Real Sample Data" from the [Blackrock Support](https://blackrockneurotech.com/support/) site. Extract the `*.ns6` file somewhere memorable in the filesystem (like `Documents`)
 1. Run nPlayServer. On Windows, use the nPlayServer shortcut on the desktop to start Central and use the nPlay control window to navigate to the `*.ns6` file directory, select the file to replay, and start replaying it.  Then close Central/nPlayServer. This is important for using the `-L` flag with `nPlayServer.exe` later.
 1. Navigate to the installation directory (e.g., "C:\Program Files\Blackrock Microsystems\Cerebus Central Suite") and locate the `nPlayServer.exe` executable.  Right click it and create a shortcut on the desktop.
-1. Rename the shortcut to "Simulate NSP" or something like that. Right click the shortcut and go to "Properties".  Set the "Target" line to: `"C:\Program Files (x86)\Blackrock Microsystems\Neuroport Central Suite\nPlayServer.exe" --network bcast=192.168.137.255:51002 --network inst=192.168.137.128:51001 -L`, adjusting for the actual install path of your Central suite.
+1. Rename the shortcut to "Simulate NSP" or another friendly name.
+
+If your intention is to only test on 'localhost' (i.e., ezmsg-blackrock and nPlayServer on the same machine), then there is nothing more to be done.
+However, if your intention is for the emulation PC to be a different machine than the client PC, nPlayServer must be configured to work over the network.
+
+1. Reconfigure the emulation host PC to have an IP address matching the emulated device (see addresses listed above). 
+1. Right click the shortcut and go to "Properties".  Set the "Target" line to: `"C:\Program Files (x86)\Blackrock Microsystems\Neuroport Central Suite\nPlayServer.exe" --network bcast=192.168.137.255:51002 --network inst=192.168.137.128:51001 -L`, adjusting for the actual install path of your Central suite.
     * `bcast` address is `.255` because that's the UDP multicast address.
-    * `inst` address is `.128` to emulate Legacy NSP.  This could be a different address for Gemini hardware.  Also, recent Gemini hardware and Central releases use `51002` for the instrument port.
+    * `inst` address is `.128` to emulate Legacy NSP. See the list above for Gemini hardware. Also, Gemini hardware requires the instrument port to be set to `51002`.
     * `-L` uses the last `.nsX` file for replay.  You can also manually specify an `.nsX` file for replay, but be aware nothing will replay when using `-L` if you've never replayed a file using nPlayServer, or if that file has moved or no longer exists.
 
 ### Software Setup

@@ -60,6 +60,26 @@ if __name__ == '__main__':
         help="Protocol Version. 3.11, 4.0, or 4.1 supported.",
     )
 
+    parser.add_argument(
+        "--cont_smp_group",
+        type=int,
+        default=0,
+        help="Continuous data Sampling Group (1-6) to publish. Set to 0 to ignore continuous data."
+    )
+
+    parser.add_argument(
+        "--cont_buffer_dur",
+        type=float,
+        default=0.5,
+        help="Duration of buffer for continuous data. Note: buffer may occupy ~15 MB / second."
+    )
+
+    parser.add_argument(
+        "--cont_override_config_all",
+        action="store_true",
+        help="Set this flag to set all analog channels to cont_smp_group (group 0 will disable continuous data)."
+    )
+
     source = NSPSource(NSPSourceSettings(**vars(parser.parse_args())))
     log = DebugLog()
 

@@ -46,8 +46,8 @@ class NSPSourceState(ez.State):
 
 
 class NSPSource(ez.Unit):
-    SETTINGS: NSPSourceSettings
-    STATE: NSPSourceState
+    SETTINGS = NSPSourceSettings
+    STATE = NSPSourceState
 
     OUTPUT_SPIKE = ez.OutputStream(SpikeEvent)
     OUTPUT_SIGNAL = ez.OutputStream(AxisArray)

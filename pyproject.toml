@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ezmsg-blackrock"
-version = "0.1.0"
+version = "0.1.1"
 description = "Blackrock Cerebus ecosystem interface for ezmsg"
 authors = ["Griffin Milsap <griffin.milsap@jhuapl.edu>"]
 readme = "README.md"

@@ -5,7 +5,7 @@ import ezmsg.core as ez
 from ezmsg.blackrock.nsp import NSPSource, NSPSourceSettings
 from ezmsg.util.debuglog import DebugLog
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Consume data from NSP")
@@ -16,8 +16,8 @@ if __name__ == '__main__':
         type=str,
         default="192.168.137.128",
         help="ipv4 address of device. pycbsdk will send control packets to this address. Subnet OK. "
-             "Use 127.0.0.1 for use with nPlayServer (non-bcast). "
-             "The default is 0.0.0.0 (IPADDR_ANY) on Mac and Linux. On Windows, known IPs will be searched.",
+        "Use 127.0.0.1 for use with nPlayServer (non-bcast). "
+        "The default is 0.0.0.0 (IPADDR_ANY) on Mac and Linux. On Windows, known IPs will be searched.",
     )
 
     parser.add_argument(
@@ -25,7 +25,7 @@ if __name__ == '__main__':
         type=int,
         default=51001,
         help="Network port to send control packets."
-             "Use 51002 for Gemini and 51001 for Legacy NSP.",
+        "Use 51002 for Gemini and 51001 for Legacy NSP.",
     )
 
     parser.add_argument(
@@ -34,7 +34,7 @@ if __name__ == '__main__':
         type=str,
         default="",
         help="ipv4 address of this machine's network adapter we will receive packets on. "
-             "Defaults to INADDR_ANY. If address is provided, assumes Cerebus Subnet.",
+        "Defaults to INADDR_ANY. If address is provided, assumes Cerebus Subnet.",
     )
 
     parser.add_argument(
@@ -50,7 +50,7 @@ if __name__ == '__main__':
         "-b",
         type=int,
         help=f"UDP socket recv buffer size. "
-             f"Default: {(8 if sys.platform == 'win32' else 6) * 1024 * 1024}.",
+        f"Default: {(8 if sys.platform == 'win32' else 6) * 1024 * 1024}.",
     )
 
     parser.add_argument(
@@ -64,29 +64,23 @@ if __name__ == '__main__':
         "--cont_smp_group",
         type=int,
         default=0,
-        help="Continuous data Sampling Group (1-6) to publish. Set to 0 to ignore continuous data."
+        help="Continuous data Sampling Group (1-6) to publish. Set to 0 to ignore continuous data.",
     )
 
     parser.add_argument(
         "--cont_buffer_dur",
         type=float,
         default=0.5,
-        help="Duration of buffer for continuous data. Note: buffer may occupy ~15 MB / second."
+        help="Duration of buffer for continuous data. Note: buffer may occupy ~15 MB / second.",
     )
 
     parser.add_argument(
         "--cont_override_config_all",
         action="store_true",
-        help="Set this flag to set all analog channels to cont_smp_group (group 0 will disable continuous data)."
+        help="Set this flag to set all analog channels to cont_smp_group (group 0 will disable continuous data).",
     )
 
     source = NSPSource(NSPSourceSettings(**vars(parser.parse_args())))
     log = DebugLog()
 
-    ez.run(
-        SOURCE=source,
-        LOG=log,
-        connections=(
-            (source.OUTPUT_SPIKE, log.INPUT),
-        )
-    )
+    ez.run(SOURCE=source, LOG=log, connections=((source.OUTPUT_SPIKE, log.INPUT),))

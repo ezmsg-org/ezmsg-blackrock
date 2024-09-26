@@ -1,4 +1,1 @@
-import importlib.metadata
-
-
-__version__ = importlib.metadata.version("ezmsg-blackrock")
+from .__version__ import __version__ as __version__

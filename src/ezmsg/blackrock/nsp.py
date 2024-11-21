@@ -1,7 +1,8 @@
-from dataclasses import dataclass, replace
 import asyncio
-import typing
 from ctypes import Structure
+from dataclasses import dataclass, replace
+import functools
+import typing
 
 import numpy as np
 import numpy.typing as npt
@@ -34,25 +35,21 @@ class NSPSourceSettings(ez.Settings):
     client_port: int = 51002
     recv_bufsize: typing.Optional[int] = None
     protocol: str = "3.11"
-    cont_smp_group: typing.Optional[int] = None
-    # ID of sample group to stream, from 1-6 or None to ignore cont. data.
 
     cont_buffer_dur: float = 0.5
     # Duration of continuous buffer to hold recv packets. Up to ~15 MB / second.
 
-    cont_override_config_all: bool = False
-    # If True, change all found channels' sample group to cont_smp_group
     # TODO: convert_uV: bool = False  # Returned values are converted to uV (True) or stay raw integers (False)
 
 
 class NSPSourceState(ez.State):
     device: cbsdk.NSPDevice
     spike_queue: asyncio.Queue[SpikeEvent]
-    cont_buffer: typing.Optional[typing.Tuple[npt.NDArray, npt.NDArray]]
-    cont_read_idx: int
-    cont_write_idx: int
-    template_cont: AxisArray
-    sysfreq: int
+    cont_buffer = {_: (np.array([], dtype=int), np.array([[]], dtype=np.int16)) for _ in range(1, 7)}
+    cont_read_idx = {_: 0 for _ in range(1, 7)}
+    cont_write_idx = {_: 0 for _ in range(1, 7)}
+    template_cont = {_: AxisArray(data=np.array([[]]), dims=["time", "ch"]) for _ in range(1, 7)}
+    sysfreq: int = 30_000  # Default for pre-Gemini system
 
 
 class NSPSource(ez.Unit):
@@ -75,92 +72,81 @@ class NSPSource(ez.Unit):
         self.STATE.device = cbsdk.NSPDevice(params)
         run_level = self.STATE.device.connect(startup_sequence=False)
         if not run_level:
-            raise ValueError(f"Failed to connect to NSP; {params=}")
+            raise ConnectionError(f"Failed to connect to NSP; {params=}")
         config = cbsdk.get_config(self.STATE.device, force_refresh=True)
         self.STATE.sysfreq = config["sysfreq"]
 
-        if self.SETTINGS.cont_override_config_all:
-            from pycbsdk.cbhw.packet.common import CBChannelType
-
-            for chid in [
-                k
-                for k, v in config["channel_infos"].items()
-                if config["channel_types"][k]
-                in (CBChannelType.FrontEnd, CBChannelType.AnalogIn)
-            ]:
-                _ = cbsdk.set_channel_config(
-                    self.STATE.device, chid, "smpgroup", self.SETTINGS.cont_smp_group
-                )
-            # Refresh config
-            await asyncio.sleep(0.5)  # Make sure all the config packets have returned.
-            config = cbsdk.get_config(self.STATE.device, force_refresh=False)
-
         _ = cbsdk.register_spk_callback(self.STATE.device, self.on_spike)
-        if self.SETTINGS.cont_smp_group is not None and (
-            1 <= self.SETTINGS.cont_smp_group <= 6
-        ):
-            n_channels = len(config["group_infos"][self.SETTINGS.cont_smp_group])
-            self._reset_buffer(n_channels)
+
+        for grp_idx in range(1, 7):
+            n_channels = len(config["group_infos"][grp_idx])
+            self._reset_buffer(grp_idx, n_channels)
             _ = cbsdk.register_group_callback(
-                self.STATE.device, self.SETTINGS.cont_smp_group, self.on_smp_group
+                self.STATE.device, grp_idx, functools.partial(self.on_smp_group, grp_idx=grp_idx),
             )
 
-    def _reset_buffer(self, n_channels) -> None:
+    def _reset_buffer(self, grp_idx: int, n_channels: int) -> None:
         buff_samples = int(
-            self.SETTINGS.cont_buffer_dur * grp_fs[self.SETTINGS.cont_smp_group]
+            self.SETTINGS.cont_buffer_dur * grp_fs[grp_idx]
         )
-        self.STATE.cont_buffer = (
+        self.STATE.cont_buffer[grp_idx] = (
             np.zeros((buff_samples,), dtype=int),
             np.zeros((buff_samples, n_channels), dtype=np.int16),
         )
-        self.STATE.cont_read_idx = 0
-        self.STATE.cont_write_idx = 0
-        time_ax = AxisArray.Axis.TimeAxis(
-            grp_fs[self.SETTINGS.cont_smp_group], offset=0.0
-        )
-        self.STATE.template_cont = AxisArray(
-            np.zeros((0, 0)), dims=["time", "ch"], axes={"time": time_ax}
+        self.STATE.cont_read_idx[grp_idx] = 0
+        self.STATE.cont_write_idx[grp_idx] = 0
+        time_ax = AxisArray.Axis.TimeAxis(grp_fs[grp_idx], offset=0.0)
+        self.STATE.template_cont[grp_idx] = AxisArray(
+            np.zeros((0, 0)),
+            dims=["time", "ch"],
+            axes={"time": time_ax},  # TODO: Ch CoordinateAxis
+            key=f"SMP{grp_idx}" if grp_idx < 6 else "RAW",
         )
 
     def shutdown(self) -> None:
-        self.STATE.device.disconnect()
+        if hasattr(self.STATE, "device") and self.STATE.device is not None:
+            self.STATE.device.disconnect()
 
-    def on_smp_group(self, pkt: Structure):
-        if len(pkt.data) != self.STATE.cont_buffer[1].shape[1]:
+    def on_smp_group(self, pkt: Structure, grp_idx: int = 5):
+        _buffer = self.STATE.cont_buffer[grp_idx]
+        _write_idx = self.STATE.cont_write_idx[grp_idx]
+        if len(pkt.data) != _buffer[1].shape[1]:
             self._reset_buffer(len(pkt.data))
-        self.STATE.cont_buffer[1][self.STATE.cont_write_idx, :] = memoryview(pkt.data)
-        self.STATE.cont_buffer[0][self.STATE.cont_write_idx] = pkt.header.time
-        self.STATE.cont_write_idx = (self.STATE.cont_write_idx + 1) % len(
-            self.STATE.cont_buffer[0]
-        )
+        _buffer[1][_write_idx, :] = memoryview(pkt.data)
+        _buffer[0][_write_idx] = pkt.header.time
+        self.STATE.cont_write_idx[grp_idx] = (_write_idx + 1) % len(_buffer[0])
 
     @ez.publisher(OUTPUT_SIGNAL)
     async def pub_cont(self) -> typing.AsyncGenerator:
         while True:
-            buff_len = len(self.STATE.cont_buffer[0])
-            read_term = (
-                self.STATE.cont_write_idx
-                if self.STATE.cont_write_idx >= self.STATE.cont_read_idx
-                else buff_len
-            )
-            if self.STATE.cont_read_idx == read_term:
+            b_any = False
+            for grp_idx in range(1, 7):
+                _buff = self.STATE.cont_buffer[grp_idx]
+                _read_idx = self.STATE.cont_read_idx[grp_idx]
+                _write_idx = self.STATE.cont_write_idx[grp_idx]
+                buff_len = len(_buff[0])
+                read_term = _write_idx if _write_idx >= _read_idx else buff_len
+                if _read_idx == read_term:
+                    continue
+                else:
+                    b_any = True
+                read_slice = slice(_read_idx, min(buff_len, read_term))
+                read_view = _buff[1][read_slice]
+                new_offset: float = _buff[0][_read_idx] / self.STATE.sysfreq
+                _templ = self.STATE.template_cont[grp_idx]
+                new_time_ax = replace(
+                    _templ.axes["time"], offset=new_offset
+                )
+                out_msg = replace(
+                    _templ,
+                    data=read_view.copy(),  # TODO: Scale to uV. Needs per-channel scale factor.
+                    axes={**_templ.axes, **{"time": new_time_ax}},
+                    key=f"SMP{grp_idx}" if grp_idx < 6 else "RAW",
+                )
+                self.STATE.cont_read_idx[grp_idx] = read_term % buff_len
+                yield self.OUTPUT_SIGNAL, out_msg
+            if not b_any:
                 await asyncio.sleep(0.001)
-                continue
-            read_slice = slice(self.STATE.cont_read_idx, min(buff_len, read_term))
-            read_view = self.STATE.cont_buffer[1][read_slice]
-            new_offset: float = (
-                self.STATE.cont_buffer[0][self.STATE.cont_read_idx] / self.STATE.sysfreq
-            )
-            new_time_ax = replace(
-                self.STATE.template_cont.axes["time"], offset=new_offset
-            )
-            out_msg = replace(
-                self.STATE.template_cont,
-                data=read_view.copy(),  # TODO: Scale to uV. Needs per-channel scale factor.
-                axes={**self.STATE.template_cont.axes, **{"time": new_time_ax}},
-            )
-            self.STATE.cont_read_idx = read_term % buff_len
-            yield self.OUTPUT_SPIKE, out_msg
 
     def on_spike(self, spk_pkt: Structure):
         self.STATE.spike_queue.put_nowait(

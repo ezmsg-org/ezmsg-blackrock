@@ -1,15 +1,13 @@
 import asyncio
 from ctypes import Structure
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import functools
 import typing
 
 import numpy as np
-import numpy.typing as npt
 from pycbsdk import cbsdk
-
 import ezmsg.core as ez
-from ezmsg.util.messages.axisarray import AxisArray
+from ezmsg.util.messages.axisarray import AxisArray, replace
 
 
 grp_fs = {1: 500, 2: 1_000, 3: 2_000, 4: 10_000, 5: 30_000, 6: 30_000}

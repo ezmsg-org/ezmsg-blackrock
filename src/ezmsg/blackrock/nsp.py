@@ -45,10 +45,15 @@ class NSPSourceSettings(ez.Settings):
 class NSPSourceState(ez.State):
     device: cbsdk.NSPDevice
     spike_queue: asyncio.Queue[SpikeEvent]
-    cont_buffer = {_: (np.array([], dtype=int), np.array([[]], dtype=np.int16)) for _ in range(1, 7)}
+    cont_buffer = {
+        _: (np.array([], dtype=int), np.array([[]], dtype=np.int16))
+        for _ in range(1, 7)
+    }
     cont_read_idx = {_: 0 for _ in range(1, 7)}
     cont_write_idx = {_: 0 for _ in range(1, 7)}
-    template_cont = {_: AxisArray(data=np.array([[]]), dims=["time", "ch"]) for _ in range(1, 7)}
+    template_cont = {
+        _: AxisArray(data=np.array([[]]), dims=["time", "ch"]) for _ in range(1, 7)
+    }
     sysfreq: int = 30_000  # Default for pre-Gemini system
 
 
@@ -82,13 +87,13 @@ class NSPSource(ez.Unit):
             n_channels = len(config["group_infos"][grp_idx])
             self._reset_buffer(grp_idx, n_channels)
             _ = cbsdk.register_group_callback(
-                self.STATE.device, grp_idx, functools.partial(self.on_smp_group, grp_idx=grp_idx),
+                self.STATE.device,
+                grp_idx,
+                functools.partial(self.on_smp_group, grp_idx=grp_idx),
             )
 
     def _reset_buffer(self, grp_idx: int, n_channels: int) -> None:
-        buff_samples = int(
-            self.SETTINGS.cont_buffer_dur * grp_fs[grp_idx]
-        )
+        buff_samples = int(self.SETTINGS.cont_buffer_dur * grp_fs[grp_idx])
         self.STATE.cont_buffer[grp_idx] = (
             np.zeros((buff_samples,), dtype=int),
             np.zeros((buff_samples, n_channels), dtype=np.int16),
@@ -134,9 +139,7 @@ class NSPSource(ez.Unit):
                 read_view = _buff[1][read_slice]
                 new_offset: float = _buff[0][_read_idx] / self.STATE.sysfreq
                 _templ = self.STATE.template_cont[grp_idx]
-                new_time_ax = replace(
-                    _templ.axes["time"], offset=new_offset
-                )
+                new_time_ax = replace(_templ.axes["time"], offset=new_offset)
                 out_msg = replace(
                     _templ,
                     data=read_view.copy(),  # TODO: Scale to uV. Needs per-channel scale factor.

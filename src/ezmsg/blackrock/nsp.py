@@ -1,6 +1,5 @@
 import asyncio
 from ctypes import Structure
-from dataclasses import dataclass
 import functools
 import typing
 

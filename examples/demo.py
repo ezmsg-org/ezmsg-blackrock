@@ -1,5 +1,4 @@
 import sys
-import typing
 
 import ezmsg.core as ez
 from ezmsg.util.debuglog import DebugLog

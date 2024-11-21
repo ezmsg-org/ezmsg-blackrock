@@ -42,7 +42,7 @@ wheels = [
 
 [[package]]
 name = "ezmsg-blackrock"
-version = "0.1.dev17+g5055ab1.d20240926"
+version = "0.1.dev19+g30af46c.d20241121"
 source = { editable = "." }
 dependencies = [
     { name = "ezmsg" },

@@ -8,22 +8,10 @@ import numpy as np
 from pycbsdk import cbsdk
 import ezmsg.core as ez
 from ezmsg.util.messages.axisarray import AxisArray, replace
+from ezmsg.event.message import EventMessage
 
 
 grp_fs = {1: 500, 2: 1_000, 3: 2_000, 4: 10_000, 5: 30_000, 6: 30_000}
-
-
-# TODO: This probably needs to be part of a larger spike signal processing library
-@dataclass
-class SpikeEvent:
-    channel: int
-    """0-based index of channel. (pkt.header.chid - 1)"""
-
-    offset: float
-    """offset in time (seconds). Might be device time, might be system time."""
-
-    id: int
-    """Unit id. 0=unsorted, 1-5 sorted, 255=noise"""
 
 
 class NSPSourceSettings(ez.Settings):
@@ -35,14 +23,14 @@ class NSPSourceSettings(ez.Settings):
     protocol: str = "3.11"
 
     cont_buffer_dur: float = 0.5
-    # Duration of continuous buffer to hold recv packets. Up to ~15 MB / second.
+    """Duration of continuous buffer to hold recv packets. Up to ~15 MB / second."""
 
     # TODO: convert_uV: bool = False  # Returned values are converted to uV (True) or stay raw integers (False)
 
 
 class NSPSourceState(ez.State):
     device: cbsdk.NSPDevice
-    spike_queue: asyncio.Queue[SpikeEvent]
+    spike_queue: asyncio.Queue[EventMessage]
     cont_buffer = {
         _: (np.array([], dtype=int), np.array([[]], dtype=np.int16))
         for _ in range(1, 7)
@@ -59,7 +47,7 @@ class NSPSource(ez.Unit):
     SETTINGS = NSPSourceSettings
     STATE = NSPSourceState
 
-    OUTPUT_SPIKE = ez.OutputStream(SpikeEvent)
+    OUTPUT_SPIKE = ez.OutputStream(EventMessage)
     OUTPUT_SIGNAL = ez.OutputStream(AxisArray)
 
     async def initialize(self) -> None:
@@ -151,10 +139,11 @@ class NSPSource(ez.Unit):
 
     def on_spike(self, spk_pkt: Structure):
         self.STATE.spike_queue.put_nowait(
-            SpikeEvent(
-                channel=spk_pkt.header.chid - 1,
+            EventMessage(
                 offset=spk_pkt.header.time / self.STATE.sysfreq,
-                id=spk_pkt.unit,
+                ch_idx=spk_pkt.header.chid - 1,
+                sub_idx=min(spk_pkt.unit, 6),  # 0=unsorted, 1-5 sorted unit, >5=noise
+                value=1,
             )
         )
 

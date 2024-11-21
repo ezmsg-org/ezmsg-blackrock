@@ -1,81 +1,81 @@
 import sys
+import typing
 
 import ezmsg.core as ez
+from ezmsg.util.debuglog import DebugLog
+import typer
+from typing_extensions import Annotated
 
 from ezmsg.blackrock.nsp import NSPSource, NSPSourceSettings
-from ezmsg.util.debuglog import DebugLog
 
 
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Consume data from NSP")
-
-    parser.add_argument(
-        "--inst_addr",
-        "-i",
-        type=str,
-        default="192.168.137.128",
-        help="ipv4 address of device. pycbsdk will send control packets to this address. Subnet OK. "
-        "Use 127.0.0.1 for use with nPlayServer (non-bcast). "
-        "The default is 0.0.0.0 (IPADDR_ANY) on Mac and Linux. On Windows, known IPs will be searched.",
-    )
-
-    parser.add_argument(
-        "--inst_port",
-        type=int,
-        default=51001,
-        help="Network port to send control packets."
-        "Use 51002 for Gemini and 51001 for Legacy NSP.",
-    )
-
-    parser.add_argument(
-        "--client_addr",
-        "-c",
-        type=str,
-        default="",
-        help="ipv4 address of this machine's network adapter we will receive packets on. "
-        "Defaults to INADDR_ANY. If address is provided, assumes Cerebus Subnet.",
-    )
-
-    parser.add_argument(
-        "--client_port",
-        "-p",
-        type=int,
-        default=51002,
-        help="Network port to receive packets. This should always be 51002.",
-    )
-
-    parser.add_argument(
-        "--recv_bufsize",
-        "-b",
-        type=int,
-        help=f"UDP socket recv buffer size. "
-        f"Default: {(8 if sys.platform == 'win32' else 6) * 1024 * 1024}.",
-    )
-
-    parser.add_argument(
-        "--protocol",
-        type=str,
-        default="3.11",
-        help="Protocol Version. 3.11, 4.0, or 4.1 supported.",
-    )
-
-    parser.add_argument(
-        "--cont_buffer_dur",
-        type=float,
-        default=0.5,
-        help="Duration of buffer for continuous data. Note: buffer may occupy ~15 MB / second.",
+def main(
+    inst_addr: Annotated[
+        str,
+        typer.Argument(
+            help="ipv4 address of device. pycbsdk will send control packets to this address. Subnet OK. Use 127.0.0.1 "
+            "for use with nPlayServer (non-bcast). The default is 0.0.0.0 (IPADDR_ANY) on Mac and Linux. On "
+            "Windows, known IPs will be searched."
+        ),
+    ] = "192.168.137.128",
+    inst_port: Annotated[
+        int,
+        typer.Argument(
+            help="Network port to send control packets. Use 51002 for Gemini and 51001 for Legacy NSP."
+        ),
+    ] = 51001,
+    client_addr: Annotated[
+        str,
+        typer.Argument(
+            help="ipv4 address of this machine's network adapter we will receive packets on. Defaults to INADDR_ANY. "
+            "If address is provided, assumes Cerebus Subnet."
+        ),
+    ] = "",
+    client_port: Annotated[
+        int,
+        typer.Argument(
+            help="Network port to receive packets. This should always be 51002."
+        ),
+    ] = 51002,
+    recv_bufsize: Annotated[
+        int, typer.Argument(help="UDP socket recv buffer size.")
+    ] = (8 if sys.platform == "win32" else 6) * 1024 * 1024,
+    protocol: Annotated[
+        str, typer.Argument(help="Protocol Version. 3.11, 4.0, or 4.1 supported.")
+    ] = "3.11",
+    cont_buffer_dur: Annotated[
+        float,
+        typer.Argument(
+            help="Duration of buffer for continuous data. Note: buffer may occupy ~15 MB / second."
+        ),
+    ] = 0.5,
+):
+    source_settings = NSPSourceSettings(
+        inst_addr,
+        inst_port,
+        client_addr,
+        client_port,
+        recv_bufsize,
+        protocol,
+        cont_buffer_dur,
     )
 
     comps = {
-        "SRC": NSPSource(NSPSourceSettings(**vars(parser.parse_args()))),
+        "SOURCE": NSPSource(source_settings),
+        # TODO: SparseResample(fs=1000.0, max_age=0.005),
+        # TODO: EventRates(),
         "SPKLOG": DebugLog(name="SPK"),
         "GRPLOG": DebugLog(name="GRP"),
     }
+
     conns = (
-        # (comps["SRC"].OUTPUT_SPIKE, comps["SPKLOG"].INPUT),
+        (comps["SRC"].OUTPUT_SPIKE, comps["SPKLOG"].INPUT),
         (comps["SRC"].OUTPUT_SIGNAL, comps["GRPLOG"].INPUT),
     )
 
     ez.run(components=comps, connections=conns)
+
+
+
+if __name__ == "__main__":
+    typer.run(main)

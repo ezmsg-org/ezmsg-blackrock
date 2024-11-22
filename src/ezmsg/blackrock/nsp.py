@@ -128,7 +128,7 @@ class NSPSource(ez.Unit):
             np.zeros((0, 0)),
             dims=["time", "ch"],
             axes={"time": time_ax, "ch": ch_ax},
-            key=f"SMP{grp_idx}" if grp_idx < 6 else "RAW",
+            key=f"ns{grp_idx}",
             attrs={"unit": "uV" if self.SETTINGS.microvolts else "raw"},
         )
 

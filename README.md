@@ -2,14 +2,13 @@
 
 Interface for Blackrock Cerebus ecosystem (incl. Neuroport) using `pycbsdk`
 
-NOTE: Currently only supports spikes, but a PR for continuous data as `ezmsg.util.messages.axisarray.AxisArray` wouldn't be a heavy lift and a readily accepted PR :D
-
 ## Installation
 `pip install git+https://github.com/CerebusOSS/ezmsg-blackrock`
 
 ## Dependencies
 
-* `pycbsdk`, which requires Python >=3.9 
+* `python` >=3.9
+* `pycbsdk` 
 * `ezmsg-sigproc`
 
 ## Setup (Development)
@@ -20,7 +19,7 @@ NOTE: Currently only supports spikes, but a PR for continuous data as `ezmsg.uti
 
 ## Setup Notes
 
-__IMPORTANT NOTE:__ _`pycbsdk` is only compatible with Central Neuroport/Cerebus Suite/NSP Firmware `7.0.6+`, built using `cbhwlib`/hardware library/network protocol `3.11+`.  Anything older is not supported by `pycbsdk`_.  Check this requirement in Central by navigating to `Help > About Central`
+__IMPORTANT NOTE:__ _`pycbsdk` is only compatible with Central Neuroport/Cerebus Suite/NSP Firmware `7.0.5+`, built using `cbhwlib`/hardware library/network protocol `3.11+`.  Anything older is not supported by `pycbsdk`_.  Check this requirement in Central by navigating to `Help > About Central`
 
 Blackrock Neuroport/Cerebus uses UDP multicast traffic to deliver upwards of 30000 packets/sec of data with low latency.  There are better ways to do this now, but back when this hardware was made, the engineers were dealing with the limitations of the hardware they had.  UDP comes with no packet delivery guarantee, but dropped packets can be catastrophic when interfacing with the Blackrock hardware.  As such, do your best to locate the highest quality networking equipment you can find, and have a high tolerance for blaming ethernet adapters and/or your router/switch for errors during troubleshooting.
 
@@ -32,7 +31,7 @@ This setup describes a setup with a Legacy NSP, a Windows PC (called "Central PC
 
 Central cannot run on the same PC simultaneously as `ezmsg-blackrock` because `pycbsdk` exclusively binds the port that central would use to communicate with the NSP.  The NSP has too many settings to implement in `ezmsg-blackrock`, so in practice, we use Central to configure the NSP then acquire live data thereafter.  If you want to, you _can_ use `ezmsg-blackrock` on the Central PC once you've configured the NSP and closed Central.  When you do this, the Central PC and the Client PC are the same PC/IP address.  Its assumed that this PC is running windows because Central Suite is only available on Windows.
 
-Find the highest quality ethernet (yes, wired) network switch or router that you can.  Look for 1+ Gigabit speed ratings (2.5 Gigabit better, 10 Gigabit is best), and features like QoS (Quality of Service) that can guarantee packet delivery. Ensure both the Central PC and the Client PC have high quality ethernet network adapters.  Not every ethernet adapter will work, due to packet buffering requirements. High quality ethernet cables are also important; aim for Cat6E or better. 
+Find the highest quality ethernet (yes, wired) network switch or router that you can.  Look for 1+ Gigabit speed ratings (2.5 Gigabit better, 10 Gigabit is best), and features like QoS (Quality of Service) that can guarantee packet delivery. Ensure both the Central PC and the Client PC have high quality ethernet network adapters.  Not every ethernet adapter will work, due to packet buffering requirements. High quality ethernet cables are also important; aim for Cat6E or better.
 
 1. Attach the NSP, Central PC, and Client PC to the router or switch using ethernet cables.
 1. Blackrock NSP and Gemini Hubs use hard-coded static IP addresses.
@@ -71,7 +70,7 @@ However, if your intention is for the emulation PC to be a different machine tha
 
 * Use Central to set up the NSP hardware.
 * If running Central and `ezmsg-blackrock` on the same PC, shut down Central
-* Assuming `pycbsdk` is installed in your python environment (which it should be, considering it's a dependency of `ezmsg-blackrock` that automatically gets installed with a `pip install -e .`), you should have the `pycbsdk_print_rates` command on your path.  Test the connection and hardware/software setup using `pycbsdk_print_rates --inst_addr 192.168.137.128 --inst_port 51001 --protocol 3.11`
+* Assuming `pycbsdk` is installed in your python environment (which it should be, considering it's a dependency of `ezmsg-blackrock` that automatically gets installed with a `pip install -e .`), you should have the `pycbsdk-rates` command on your path.  Test the connection and hardware/software setup using `pycbsdk-rates --inst_addr 192.168.137.128 --inst_port 51001 --protocol 3.11`
     * Note that this command line is for Legacy NSP with hard-coded address `192.168.137.128` running on port 51001
     * Also note that network protocol is not automatically detected.  Our old hardware can only be updated to firmware `7.0.6` which uses hardware library/protocol `3.11`.  This can be checked by opening Central and navigating to "About Central" which will tell you which hardware library the firmware is running (assuming your NSP's firmware and Central version match). As of this writing, most Gemini hardware should be using protocol 4.1 (default).
 
@@ -82,4 +81,4 @@ However, if your intention is for the emulation PC to be a different machine tha
 * Make sure the Central PC and the Client PC can ping each other and the NSP.
 * Ensure NSP Firmware matches Central version.
 * Ensure the protocol version you specify matches the firmware's protocol version.
-* `pycbsdk_print_rates` and Wireshark + [a dissector](https://github.com/CerebusOSS/CerebusWireshark) are your friends. Godspeed.
+* `pycbsdk-rates` and Wireshark + [a dissector](https://github.com/CerebusOSS/CerebusWireshark) are your friends. Godspeed.

@@ -9,8 +9,9 @@ readme = "README.md"
 requires-python = ">=3.9"
 dynamic = ["version"]
 dependencies = [
-    "ezmsg>=3.5.0",
-    "pycbsdk>=0.1.3",
+    "ezmsg-event",
+    "ezmsg>=3.6.0",
+    "pycbsdk>=0.2.0",
 ]
 
 [project.optional-dependencies]
@@ -34,4 +35,5 @@ packages = ["src/ezmsg"]
 [tool.uv]
 dev-dependencies = [
     "ruff>=0.6.8",
+    "typer>=0.12.5",
 ]

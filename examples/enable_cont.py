@@ -1,14 +1,14 @@
 import sys
-
-import ezmsg.core as ez
-from ezmsg.util.debuglog import DebugLog
-import typer
+import time
 from typing_extensions import Annotated
 
-from ezmsg.blackrock.nsp import NSPSource, NSPSourceSettings
+from pycbsdk import cbsdk
+from pycbsdk.cbhw.packet.common import CBChannelType
+import typer
 
 
 def main(
+    smp_group: int,
     inst_addr: Annotated[
         str,
         typer.Option(
@@ -42,38 +42,32 @@ def main(
     protocol: Annotated[
         str, typer.Option(help="Protocol Version. 3.11, 4.0, or 4.1 supported.")
     ] = "3.11",
-    cont_buffer_dur: Annotated[
-        float,
-        typer.Option(
-            help="Duration of buffer for continuous data. Note: buffer may occupy ~15 MB / second."
-        ),
-    ] = 0.5,
 ):
-    source_settings = NSPSourceSettings(
-        inst_addr,
-        inst_port,
-        client_addr,
-        client_port,
-        recv_bufsize,
-        protocol,
-        cont_buffer_dur,
+
+    params = cbsdk.create_params(
+        inst_addr=inst_addr,
+        inst_port=inst_port,
+        client_addr=client_addr,
+        client_port=client_port,
+        recv_bufsize=recv_bufsize,
+        protocol=protocol,
     )
-
-    comps = {
-        "SRC": NSPSource(source_settings),
-        # TODO: SparseResample(fs=1000.0, max_age=0.005),
-        # TODO: EventRates(),
-        "SPKLOG": DebugLog(name="SPK"),
-        "GRPLOG": DebugLog(name="GRP"),
-    }
-
-    conns = (
-        (comps["SRC"].OUTPUT_SPIKE, comps["SPKLOG"].INPUT),
-        (comps["SRC"].OUTPUT_SIGNAL, comps["GRPLOG"].INPUT),
-    )
-
-    ez.run(components=comps, connections=conns)
-
+    device = cbsdk.NSPDevice(params)
+    run_level = device.connect(startup_sequence=False)
+    if not run_level:
+        raise ValueError(f"Failed to connect to NSP; {params=}")
+    config = cbsdk.get_config(device, force_refresh=True)
+    for chid in [
+        k
+        for k, v in config["channel_infos"].items()
+        if config["channel_types"][k]
+           in (CBChannelType.FrontEnd, CBChannelType.AnalogIn)
+    ]:
+        _ = cbsdk.set_channel_config(
+            device, chid, "smpgroup", smp_group
+        )
+    # Refresh config
+    time.sleep(0.5)  # Make sure all the config packets have returned.
 
 
 if __name__ == "__main__":

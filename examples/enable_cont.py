@@ -36,14 +36,15 @@ def main(
             help="Network port to receive packets. This should always be 51002."
         ),
     ] = 51002,
-    recv_bufsize: Annotated[
-        int, typer.Option(help="UDP socket recv buffer size.")
-    ] = (8 if sys.platform == "win32" else 6) * 1024 * 1024,
+    recv_bufsize: Annotated[int, typer.Option(help="UDP socket recv buffer size.")] = (
+        8 if sys.platform == "win32" else 6
+    )
+    * 1024
+    * 1024,
     protocol: Annotated[
         str, typer.Option(help="Protocol Version. 3.11, 4.0, or 4.1 supported.")
     ] = "3.11",
 ):
-
     params = cbsdk.create_params(
         inst_addr=inst_addr,
         inst_port=inst_port,
@@ -61,11 +62,9 @@ def main(
         k
         for k, v in config["channel_infos"].items()
         if config["channel_types"][k]
-           in (CBChannelType.FrontEnd, CBChannelType.AnalogIn)
+        in (CBChannelType.FrontEnd, CBChannelType.AnalogIn)
     ]:
-        _ = cbsdk.set_channel_config(
-            device, chid, "smpgroup", smp_group
-        )
+        _ = cbsdk.set_channel_config(device, chid, "smpgroup", smp_group)
     # Refresh config
     time.sleep(0.5)  # Make sure all the config packets have returned.
 

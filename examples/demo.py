@@ -36,9 +36,11 @@ def main(
             help="Network port to receive packets. This should always be 51002."
         ),
     ] = 51002,
-    recv_bufsize: Annotated[
-        int, typer.Option(help="UDP socket recv buffer size.")
-    ] = (8 if sys.platform == "win32" else 6) * 1024 * 1024,
+    recv_bufsize: Annotated[int, typer.Option(help="UDP socket recv buffer size.")] = (
+        8 if sys.platform == "win32" else 6
+    )
+    * 1024
+    * 1024,
     protocol: Annotated[
         str, typer.Option(help="Protocol Version. 3.11, 4.0, or 4.1 supported.")
     ] = "3.11",
@@ -48,6 +50,12 @@ def main(
             help="Duration of buffer for continuous data. Note: buffer may occupy ~15 MB / second."
         ),
     ] = 0.5,
+    microvolts: Annotated[
+        bool,
+        typer.Option(
+            help="Convert continuous data to microvolts (True) or keep raw integers (False)."
+        ),
+    ] = True,
 ):
     source_settings = NSPSourceSettings(
         inst_addr,
@@ -57,6 +65,7 @@ def main(
         recv_bufsize,
         protocol,
         cont_buffer_dur,
+        microvolts,
     )
 
     comps = {
@@ -73,7 +82,6 @@ def main(
     )
 
     ez.run(components=comps, connections=conns)
-
 
 
 if __name__ == "__main__":

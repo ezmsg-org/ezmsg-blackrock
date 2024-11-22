@@ -9,6 +9,8 @@ import ezmsg.core as ez
 from ezmsg.util.messages.axisarray import AxisArray, replace
 from ezmsg.event.message import EventMessage
 
+from .util import ClockSync
+
 
 grp_fs = {1: 500, 2: 1_000, 3: 2_000, 4: 10_000, 5: 30_000, 6: 30_000}
 
@@ -26,6 +28,12 @@ class NSPSourceSettings(ez.Settings):
 
     microvolts: bool = True
     """Convert continuous data to uV (True) or keep raw integers (False)."""
+
+    cbtime: bool = True
+    """
+    Use Cerebus time for continuous data (True) or local time.time (False).
+    Note that time.time is delayed by the network transmission latency relative to Cerebus time.
+    """
 
 
 class NSPSourceState(ez.State):
@@ -70,6 +78,13 @@ class NSPSource(ez.Unit):
             raise ConnectionError(f"Failed to connect to NSP; {params=}")
         config = cbsdk.get_config(self.STATE.device, force_refresh=True)
         self.STATE.sysfreq = config["sysfreq"]
+
+        self._clock_sync = ClockSync(alpha=0.1, sysfreq=self.STATE.sysfreq)
+        monitor_state = self.STATE.device.get_monitor_state()
+        while monitor_state["pkts_received"] < 1:
+            await asyncio.sleep(0.1)
+            monitor_state = self.STATE.device.get_monitor_state()
+        self._clock_sync.add_pair(monitor_state["time"], monitor_state["sys_time"])
 
         _ = cbsdk.register_spk_callback(self.STATE.device, self.on_spike)
 
@@ -132,6 +147,16 @@ class NSPSource(ez.Unit):
         _buffer[0][_write_idx] = pkt.header.time
         self.STATE.cont_write_idx[grp_idx] = (_write_idx + 1) % len(_buffer[0])
 
+    @ez.task
+    async def update_clock(self) -> None:
+        while True:
+            await asyncio.sleep(1.0)
+            if self.STATE.device is not None:
+                monitor_state = self.STATE.device.get_monitor_state()
+                self._clock_sync.add_pair(
+                    monitor_state["time"], monitor_state["sys_time"]
+                )
+
     @ez.publisher(OUTPUT_SIGNAL)
     async def pub_cont(self) -> typing.AsyncGenerator:
         while True:
@@ -150,7 +175,10 @@ class NSPSource(ez.Unit):
                 out_dat = _buff[1][read_slice].copy()
                 if self.SETTINGS.microvolts:
                     out_dat = out_dat * self.STATE.scale_cont[grp_idx][None, :]
-                new_offset: float = _buff[0][_read_idx] / self.STATE.sysfreq
+                if self.SETTINGS.cbtime:
+                    new_offset: float = _buff[0][_read_idx] / self.STATE.sysfreq
+                else:
+                    new_offset: float = self._clock_sync.nsp2system(_buff[0][_read_idx])
                 _templ = self.STATE.template_cont[grp_idx]
                 new_time_ax = replace(_templ.axes["time"], offset=new_offset)
                 out_msg = replace(
@@ -166,7 +194,9 @@ class NSPSource(ez.Unit):
     def on_spike(self, spk_pkt: Structure):
         self.STATE.spike_queue.put_nowait(
             EventMessage(
-                offset=spk_pkt.header.time / self.STATE.sysfreq,
+                offset=spk_pkt.header.time / self.STATE.sysfreq
+                if self.SETTINGS.cbtime
+                else self._clock_sync.nsp2system(spk_pkt.header.time),
                 ch_idx=spk_pkt.header.chid - 1,
                 sub_idx=min(spk_pkt.unit, 6),  # 0=unsorted, 1-5 sorted unit, >5=noise
                 value=1,

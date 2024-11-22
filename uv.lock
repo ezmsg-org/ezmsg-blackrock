@@ -54,7 +54,7 @@ wheels = [
 
 [[package]]
 name = "ezmsg-blackrock"
-version = "0.1.dev27+g92dd0de.d20241121"
+version = "0.1.dev34+g9bd23f7"
 source = { editable = "." }
 dependencies = [
     { name = "ezmsg" },
@@ -288,16 +288,16 @@ wheels = [
 
 [[package]]
 name = "pycbsdk"
-version = "0.2.0"
+version = "0.2.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aenum" },
     { name = "ifaddr" },
     { name = "numpy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b3/d7/84cd6264724fc9d67553623948d9f4690b0ebc6f6031b342751e97677d51/pycbsdk-0.2.0.tar.gz", hash = "sha256:0b2df01c16e9959332fcd6fafb38b9344dab3cf5984b26b903b7f49a91a84595", size = 59365 }
+sdist = { url = "https://files.pythonhosted.org/packages/87/f8/10de0a80b2c37bb6cedc9bcbcf1e063e679b08bbd1003890cefadc68da97/pycbsdk-0.2.1.tar.gz", hash = "sha256:d7074f0ed28a15655fb47d0491534b46d53074271119a4467d5998feb9489b6c", size = 59428 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5e/e7/88bc7745f012fdafdaa3192224f1b03fdcf24c2a50a84b6121d4679dfbe9/pycbsdk-0.2.0-py3-none-any.whl", hash = "sha256:562b28b52566a4334e8344ef64d14e9c65ed610c6c23f467eaea82c916c61fee", size = 51292 },
+    { url = "https://files.pythonhosted.org/packages/e7/9b/c1b9bc5771f3b85f533de11f99075f1ec191dc26ba8d92c1dfd2068b5ca7/pycbsdk-0.2.1-py3-none-any.whl", hash = "sha256:c7d6052a4a630e9cc3b80ffbd61b08d4c3e9165f2985c3901cd19da041dd9e64", size = 51353 },
 ]
 
 [[package]]

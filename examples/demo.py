@@ -2,6 +2,7 @@ import sys
 
 import ezmsg.core as ez
 from ezmsg.util.debuglog import DebugLog
+from ezmsg.util.messages.key import FilterOnKey
 import typer
 from typing_extensions import Annotated
 
@@ -77,15 +78,16 @@ def main(
 
     comps = {
         "SRC": NSPSource(source_settings),
+        "NS5": FilterOnKey(key="ns5"),
         # TODO: SparseResample(fs=1000.0, max_age=0.005),
         # TODO: EventRates(),
-        "SPKLOG": DebugLog(name="SPK"),
-        "GRPLOG": DebugLog(name="GRP"),
+        "SPKLOG": DebugLog(name="NEV"),
+        "NS5LOG": DebugLog(name="NS5"),
     }
 
     conns = (
         (comps["SRC"].OUTPUT_SPIKE, comps["SPKLOG"].INPUT),
-        (comps["SRC"].OUTPUT_SIGNAL, comps["GRPLOG"].INPUT),
+        (comps["SRC"].OUTPUT_SIGNAL, comps["NS5LOG"].INPUT),
     )
 
     ez.run(components=comps, connections=conns)

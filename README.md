@@ -9,7 +9,7 @@ Interface for Blackrock Cerebus ecosystem (incl. Neuroport) using `pycbsdk`
 
 * `python` >=3.9
 * `pycbsdk` 
-* `ezmsg-sigproc`
+* `ezmsg-event`
 
 ## Setup (Development)
 

@@ -32,7 +32,10 @@ class NSPSourceState(ez.State):
     device: cbsdk.NSPDevice
     spike_queue: asyncio.Queue[EventMessage]
     cont_buffer = {
-        _: (np.array([], dtype=int), np.array([[]], dtype=np.int16))
+        _: (
+            np.array([], dtype=int),
+            np.array([[]], dtype=np.int16),
+        )
         for _ in range(1, 7)
     }
     cont_read_idx = {_: 0 for _ in range(1, 7)}
@@ -71,14 +74,15 @@ class NSPSource(ez.Unit):
         _ = cbsdk.register_spk_callback(self.STATE.device, self.on_spike)
 
         for grp_idx in range(1, 7):
-            self._reset_buffer(grp_idx, config)
+            self._reset_buffer(grp_idx)
             _ = cbsdk.register_group_callback(
                 self.STATE.device,
                 grp_idx,
                 functools.partial(self.on_smp_group, grp_idx=grp_idx),
             )
 
-    def _reset_buffer(self, grp_idx: int, config: dict) -> None:
+    def _reset_buffer(self, grp_idx: int) -> None:
+        config: dict = self.STATE.device.config
         chanset = config["group_infos"][grp_idx]
         buff_samples = int(self.SETTINGS.cont_buffer_dur * grp_fs[grp_idx])
         n_channels = len(chanset)
@@ -123,7 +127,7 @@ class NSPSource(ez.Unit):
         _buffer = self.STATE.cont_buffer[grp_idx]
         _write_idx = self.STATE.cont_write_idx[grp_idx]
         if len(pkt.data) != _buffer[1].shape[1]:
-            self._reset_buffer(len(pkt.data))
+            self._reset_buffer(grp_idx)
         _buffer[1][_write_idx, :] = memoryview(pkt.data)
         _buffer[0][_write_idx] = pkt.header.time
         self.STATE.cont_write_idx[grp_idx] = (_write_idx + 1) % len(_buffer[0])

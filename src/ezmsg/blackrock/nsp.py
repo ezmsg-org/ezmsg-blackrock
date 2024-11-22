@@ -9,6 +9,8 @@ import ezmsg.core as ez
 from ezmsg.util.messages.axisarray import AxisArray, replace
 from ezmsg.event.message import EventMessage
 
+from .util import ClockSync
+
 
 grp_fs = {1: 500, 2: 1_000, 3: 2_000, 4: 10_000, 5: 30_000, 6: 30_000}
 
@@ -27,12 +29,21 @@ class NSPSourceSettings(ez.Settings):
     microvolts: bool = True
     """Convert continuous data to uV (True) or keep raw integers (False)."""
 
+    cbtime: bool = True
+    """
+    Use Cerebus time for continuous data (True) or local time.time (False).
+    Note that time.time is delayed by the network transmission latency relative to Cerebus time.
+    """
+
 
 class NSPSourceState(ez.State):
     device: cbsdk.NSPDevice
     spike_queue: asyncio.Queue[EventMessage]
     cont_buffer = {
-        _: (np.array([], dtype=int), np.array([[]], dtype=np.int16))
+        _: (
+            np.array([], dtype=int),
+            np.array([[]], dtype=np.int16),
+        )
         for _ in range(1, 7)
     }
     cont_read_idx = {_: 0 for _ in range(1, 7)}
@@ -68,17 +79,25 @@ class NSPSource(ez.Unit):
         config = cbsdk.get_config(self.STATE.device, force_refresh=True)
         self.STATE.sysfreq = config["sysfreq"]
 
+        self._clock_sync = ClockSync(alpha=0.1, sysfreq=self.STATE.sysfreq)
+        monitor_state = self.STATE.device.get_monitor_state()
+        while monitor_state["pkts_received"] < 1:
+            await asyncio.sleep(0.1)
+            monitor_state = self.STATE.device.get_monitor_state()
+        self._clock_sync.add_pair(monitor_state["time"], monitor_state["sys_time"])
+
         _ = cbsdk.register_spk_callback(self.STATE.device, self.on_spike)
 
         for grp_idx in range(1, 7):
-            self._reset_buffer(grp_idx, config)
+            self._reset_buffer(grp_idx)
             _ = cbsdk.register_group_callback(
                 self.STATE.device,
                 grp_idx,
                 functools.partial(self.on_smp_group, grp_idx=grp_idx),
             )
 
-    def _reset_buffer(self, grp_idx: int, config: dict) -> None:
+    def _reset_buffer(self, grp_idx: int) -> None:
+        config: dict = self.STATE.device.config
         chanset = config["group_infos"][grp_idx]
         buff_samples = int(self.SETTINGS.cont_buffer_dur * grp_fs[grp_idx])
         n_channels = len(chanset)
@@ -123,10 +142,20 @@ class NSPSource(ez.Unit):
         _buffer = self.STATE.cont_buffer[grp_idx]
         _write_idx = self.STATE.cont_write_idx[grp_idx]
         if len(pkt.data) != _buffer[1].shape[1]:
-            self._reset_buffer(len(pkt.data))
+            self._reset_buffer(grp_idx)
         _buffer[1][_write_idx, :] = memoryview(pkt.data)
         _buffer[0][_write_idx] = pkt.header.time
         self.STATE.cont_write_idx[grp_idx] = (_write_idx + 1) % len(_buffer[0])
+
+    @ez.task
+    async def update_clock(self) -> None:
+        while True:
+            await asyncio.sleep(1.0)
+            if self.STATE.device is not None:
+                monitor_state = self.STATE.device.get_monitor_state()
+                self._clock_sync.add_pair(
+                    monitor_state["time"], monitor_state["sys_time"]
+                )
 
     @ez.publisher(OUTPUT_SIGNAL)
     async def pub_cont(self) -> typing.AsyncGenerator:
@@ -146,7 +175,10 @@ class NSPSource(ez.Unit):
                 out_dat = _buff[1][read_slice].copy()
                 if self.SETTINGS.microvolts:
                     out_dat = out_dat * self.STATE.scale_cont[grp_idx][None, :]
-                new_offset: float = _buff[0][_read_idx] / self.STATE.sysfreq
+                if self.SETTINGS.cbtime:
+                    new_offset: float = _buff[0][_read_idx] / self.STATE.sysfreq
+                else:
+                    new_offset: float = self._clock_sync.nsp2system(_buff[0][_read_idx])
                 _templ = self.STATE.template_cont[grp_idx]
                 new_time_ax = replace(_templ.axes["time"], offset=new_offset)
                 out_msg = replace(
@@ -162,7 +194,9 @@ class NSPSource(ez.Unit):
     def on_spike(self, spk_pkt: Structure):
         self.STATE.spike_queue.put_nowait(
             EventMessage(
-                offset=spk_pkt.header.time / self.STATE.sysfreq,
+                offset=spk_pkt.header.time / self.STATE.sysfreq
+                if self.SETTINGS.cbtime
+                else self._clock_sync.nsp2system(spk_pkt.header.time),
                 ch_idx=spk_pkt.header.chid - 1,
                 sub_idx=min(spk_pkt.unit, 6),  # 0=unsorted, 1-5 sorted unit, >5=noise
                 value=1,

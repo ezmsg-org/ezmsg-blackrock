@@ -56,6 +56,12 @@ def main(
             help="Convert continuous data to microvolts (True) or keep raw integers (False)."
         ),
     ] = True,
+    cbtime: Annotated[
+        bool,
+        typer.Option(
+            help="Use Cerebus time for continuous data (True) or local time.time (False)."
+        ),
+    ] = True,
 ):
     source_settings = NSPSourceSettings(
         inst_addr,
@@ -66,6 +72,7 @@ def main(
         protocol,
         cont_buffer_dur,
         microvolts,
+        cbtime,
     )
 
     comps = {

@@ -77,7 +77,7 @@ class NSPSource(ez.Unit):
         if not run_level:
             raise ConnectionError(f"Failed to connect to NSP; {params=}")
         config = cbsdk.get_config(self.STATE.device, force_refresh=True)
-        self.STATE.sysfreq = config["sysfreq"]
+        self.STATE.sysfreq = 1e9 if config["b_gemini"] else config["sysfreq"]
 
         self._clock_sync = ClockSync(alpha=0.1, sysfreq=self.STATE.sysfreq)
         monitor_state = self.STATE.device.get_monitor_state()

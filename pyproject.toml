@@ -11,7 +11,7 @@ dynamic = ["version"]
 dependencies = [
     "ezmsg-event",
     "ezmsg>=3.6.1",
-    "pycbsdk>=0.2.3",
+    "pycbsdk>=0.3.2",
 ]
 
 [project.optional-dependencies]

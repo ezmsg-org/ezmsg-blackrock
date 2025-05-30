@@ -23,6 +23,10 @@ class ClockSync:
             self._sysfreq = sysfreq
 
     def add_pair(self, nsp_time, sys_time):
+        # The protocol monitor packet arrived in the system 560 usec after
+        #  it left the Gemini device. We can get the Gemini clock in our
+        #  system time by subtracting this number:
+        sys_time = sys_time - 0.00056
         offset = sys_time - nsp_time / self.sysfreq
         if self.offset is None or (
             self._last_pair is not None

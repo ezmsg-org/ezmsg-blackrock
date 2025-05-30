@@ -7,6 +7,15 @@ from pycbsdk.cbhw.packet.common import CBChannelType
 import typer
 
 
+smp_filters_for_grp = {
+    1: 5,  # samp 500 Hz, filter LP 125 Hz
+    2: 6,  # samp 1_000 Hz, filter LP 250 Hz
+    3: 7,  # samp 2_000 Hz, filter LP 500 Hz
+    4: 10,  # samp 10_000 Hz, filter LP 2_500 Hz
+    # 5 and 6 use the analog filters
+}
+
+
 def main(
     smp_group: int,
     inst_addr: Annotated[
@@ -58,13 +67,21 @@ def main(
     if not run_level:
         raise ValueError(f"Failed to connect to NSP; {params=}")
     config = cbsdk.get_config(device, force_refresh=True)
+    # Disable all channels:
+    cbsdk.set_all_channels_disable(device, CBChannelType.FrontEnd)
+    cbsdk.set_all_channels_disable(device, CBChannelType.AnalogIn)
+    # Enable only FrontEnd and AnalogIn channels on desired SMP group:
     for chid in [
         k
         for k, v in config["channel_infos"].items()
         if config["channel_types"][k]
         in (CBChannelType.FrontEnd, CBChannelType.AnalogIn)
     ]:
-        _ = cbsdk.set_channel_config(device, chid, "smpgroup", smp_group)
+        if smp_group in smp_filters_for_grp:
+            smp_filter = smp_filters_for_grp[smp_group]
+            _ = cbsdk.set_channel_continuous_raw_data(device, chid, smp_group, smp_filter)
+        else:
+            _ = cbsdk.set_channel_config(device, chid, "smpgroup", smp_group)
     # Refresh config
     time.sleep(0.5)  # Make sure all the config packets have returned.
 

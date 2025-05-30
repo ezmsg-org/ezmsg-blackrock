@@ -10,8 +10,8 @@ requires-python = ">=3.9"
 dynamic = ["version"]
 dependencies = [
     "ezmsg-event",
-    "ezmsg>=3.6.0",
-    "pycbsdk>=0.2.1",
+    "ezmsg>=3.6.1",
+    "pycbsdk>=0.3.2",
 ]
 
 [project.optional-dependencies]

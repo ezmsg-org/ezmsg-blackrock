@@ -53,6 +53,7 @@ class NSPSourceState(ez.State):
     }
     scale_cont = {_: np.array([]) for _ in range(1, 7)}
     sysfreq: int = 30_000  # Default for pre-Gemini system
+    n_channels: int = 0
 
 
 class NSPSource(ez.Unit):
@@ -77,7 +78,7 @@ class NSPSource(ez.Unit):
         if not run_level:
             raise ConnectionError(f"Failed to connect to NSP; {params=}")
         config = cbsdk.get_config(self.STATE.device, force_refresh=True)
-        self.STATE.sysfreq = config["sysfreq"]
+        self.STATE.sysfreq = 1e9 if config["b_gemini"] else config["sysfreq"]
 
         self._clock_sync = ClockSync(alpha=0.1, sysfreq=self.STATE.sysfreq)
         monitor_state = self.STATE.device.get_monitor_state()
@@ -100,10 +101,10 @@ class NSPSource(ez.Unit):
         config: dict = self.STATE.device.config
         chanset = config["group_infos"][grp_idx]
         buff_samples = int(self.SETTINGS.cont_buffer_dur * grp_fs[grp_idx])
-        n_channels = len(chanset)
+        self.STATE.n_channels = len(chanset)
         self.STATE.cont_buffer[grp_idx] = (
             np.zeros((buff_samples,), dtype=int),
-            np.zeros((buff_samples, n_channels), dtype=np.int16),
+            np.zeros((buff_samples, self.STATE.n_channels), dtype=np.int16),
         )
         self.STATE.cont_read_idx[grp_idx] = 0
         self.STATE.cont_write_idx[grp_idx] = 0
@@ -141,9 +142,9 @@ class NSPSource(ez.Unit):
     def on_smp_group(self, pkt: Structure, grp_idx: int = 5):
         _buffer = self.STATE.cont_buffer[grp_idx]
         _write_idx = self.STATE.cont_write_idx[grp_idx]
-        if len(pkt.data) != _buffer[1].shape[1]:
+        if self.STATE.n_channels != len(pkt.data):
             self._reset_buffer(grp_idx)
-        _buffer[1][_write_idx, :] = memoryview(pkt.data)
+        _buffer[1][_write_idx, :] = memoryview(pkt.data[:self.STATE.n_channels])
         _buffer[0][_write_idx] = pkt.header.time
         self.STATE.cont_write_idx[grp_idx] = (_write_idx + 1) % len(_buffer[0])
 

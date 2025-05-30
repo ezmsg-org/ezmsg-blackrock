@@ -160,3 +160,4 @@ cython_debug/
 .idea/
 
 src/ezmsg/blackrock/__version__.py
+uv.lock

@@ -73,18 +73,33 @@ def test_latency():
     expected_time = dev_time + samp_count / 30_000
     latency = sub_time - expected_time
 
+    skip_ix = 3_000
+    lat_mean = np.mean(latency[skip_ix:] * 1000)
+    lat_std = np.std(latency[skip_ix:] * 1000)
+    count_mean = np.mean(samp_count[skip_ix:])
+    count_std = np.std(samp_count[skip_ix:])
+    print(f"Latency mean: {lat_mean:.2f} +- {lat_std:.2f} msec")
+    print(f"Samples per chunk mean: {count_mean:.2f} +- {count_std:.2f} samples")
+
     try:
-        skip_ix = 3_000
+
         import matplotlib.pyplot as plt
         plt.rcParams.update({'font.size': 18})
         plt.figure(figsize=(10, 6))
         plt.subplot(1, 2, 1)
         plt.title("Device -> Subscriber Latency")
         plt.hist(latency[skip_ix:] * 1000, bins=100, density=True)
-        plt.xlabel("(msec)")
+        plt.xlabel(f"(msec; mean={lat_mean:.2f})")
+        plt.axvline(lat_mean, linestyle="-", color="black")
+        plt.axvline(lat_mean + lat_std, linestyle="--", color="gray")
+        plt.axvline(lat_mean - lat_std, linestyle="--", color="gray")
+        plt.xlim([-1.0, 3.0])
         plt.subplot(1, 2, 2)
         plt.title("Frames Per Chunk\n(256 ch)")
         plt.hist(samp_count[skip_ix:], bins=100, density=True)
+        plt.axvline(count_mean, linestyle="-", color="black")
+        plt.axvline(count_mean + count_std, linestyle="--", color="gray")
+        plt.axvline(count_mean - count_std, linestyle="--", color="gray")
         plt.tight_layout()
         plt.show()
     except ImportError:

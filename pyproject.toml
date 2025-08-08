@@ -6,17 +6,24 @@ authors = [
   { name = "Chadwick Boulay", email = "chadwick.boulay@gmail.com" },
 ]
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
     "ezmsg-event",
     "ezmsg>=3.6.1",
-    "pycbsdk>=0.3.2",
+    "pycbsdk>=0.4.0",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
+dev = [
+  {include-group = "lint"},
+  {include-group = "test"},
+]
+lint = [
+  "ruff"
+]
 test = [
-    "pytest>=8.3.3",
+  "pytest"
 ]
 
 [build-system]

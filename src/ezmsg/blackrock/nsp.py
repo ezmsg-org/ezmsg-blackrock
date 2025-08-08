@@ -144,7 +144,7 @@ class NSPSource(ez.Unit):
         _write_idx = self.STATE.cont_write_idx[grp_idx]
         if self.STATE.n_channels != len(pkt.data):
             self._reset_buffer(grp_idx)
-        _buffer[1][_write_idx, :] = memoryview(pkt.data[:self.STATE.n_channels])
+        _buffer[1][_write_idx, :] = memoryview(pkt.data[: self.STATE.n_channels])
         _buffer[0][_write_idx] = pkt.header.time
         self.STATE.cont_write_idx[grp_idx] = (_write_idx + 1) % len(_buffer[0])
 

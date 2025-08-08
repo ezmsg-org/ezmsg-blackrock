@@ -3,11 +3,11 @@
 Interface for Blackrock Cerebus ecosystem (incl. Neuroport) using `pycbsdk`
 
 ## Installation
-`pip install git+https://github.com/CerebusOSS/ezmsg-blackrock`
+`pip install ezmsg-blackrock`
 
 ## Dependencies
 
-* `python` >=3.9
+* `python` >=3.10
 * `pycbsdk` 
 * `ezmsg-event`
 
@@ -62,9 +62,9 @@ However, if your intention is for the emulation PC to be a different machine tha
 
 1. Reconfigure the emulation host PC to have an IP address matching the emulated device (see addresses listed above). 
 1. Right click the shortcut and go to "Properties".  Set the "Target" line to: `"C:\Program Files (x86)\Blackrock Microsystems\Neuroport Central Suite\nPlayServer.exe" --network bcast=192.168.137.255:51002 --network inst=192.168.137.128:51001 -L`, adjusting for the actual install path of your Central suite.
-    * `bcast` address is `.255` because that's the UDP multicast address.
-    * `inst` address is `.128` to emulate Legacy NSP. See the list above for Gemini hardware. Also, Gemini hardware requires the instrument port to be set to `51002`.
-    * `-L` uses the last `.nsX` file for replay.  You can also manually specify an `.nsX` file for replay, but be aware nothing will replay when using `-L` if you've never replayed a file using nPlayServer, or if that file has moved or no longer exists.
+    * `bcast` address terminates in `.255` because that's the UDP multicast address.
+    * `inst` address terminates in `.128` to emulate Legacy NSP. See the list above for Gemini hardware. Also, Gemini hardware requires the instrument port to be set to `51002`.
+    * `-L` uses the last `.nsX` file for replay. You can also manually specify an `.nsX` file for replay, but be aware nothing will replay when using `-L` if you've never replayed a file using nPlayServer, or if that file has moved or no longer exists.
 
 ### Software Setup
 

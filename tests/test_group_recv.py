@@ -15,7 +15,7 @@ import numpy as np
 from ezmsg.blackrock.nsp import NSPSource
 
 
-class MyEncoder(mc.MessageEncoder):#json.JSONEncoder):
+class MyEncoder(mc.MessageEncoder):  # json.JSONEncoder):
     def default(self, obj: typing.Any) -> typing.Any:
         if type(obj) is LogStart:
             return {}
@@ -27,6 +27,8 @@ class MyEncoder(mc.MessageEncoder):#json.JSONEncoder):
 def handle_log_object(obj: typing.Any) -> str:
     """Custom log_object function to use high-resolution timestamps."""
     return json.dumps({"ts": time.time(), "obj": obj}, cls=MyEncoder)
+
+
 ml.log_object = handle_log_object
 
 IN_GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
@@ -65,10 +67,18 @@ def test_latency():
     test_path.unlink(missing_ok=True)
 
     # Create data array; sub_time, dev_time, samp_count
-    data = np.array([[_["ts"], _["obj"]["ts"], _["obj"]["samps"]] for _ in log_data if "obj" in _ and "ts" in _["obj"]])
+    data = np.array(
+        [
+            [_["ts"], _["obj"]["ts"], _["obj"]["samps"]]
+            for _ in log_data
+            if "obj" in _ and "ts" in _["obj"]
+        ]
+    )
 
     sub_time = data[:, 0]  # Time at the subscriber (PC clock)
-    dev_time = data[:, 1]  # Estimated time (PC clock) when the first sample in the chunk left the device.
+    dev_time = data[
+        :, 1
+    ]  # Estimated time (PC clock) when the first sample in the chunk left the device.
     samp_count = data[:, 2]  # Number of samples in this chunk.
     expected_time = dev_time + samp_count / 30_000
     latency = sub_time - expected_time
@@ -82,9 +92,9 @@ def test_latency():
     print(f"Samples per chunk mean: {count_mean:.2f} +- {count_std:.2f} samples")
 
     try:
-
         import matplotlib.pyplot as plt
-        plt.rcParams.update({'font.size': 18})
+
+        plt.rcParams.update({"font.size": 18})
         plt.figure(figsize=(10, 6))
         plt.subplot(1, 2, 1)
         plt.title("Device -> Subscriber Latency")

@@ -25,6 +25,13 @@ lint = [
 test = [
   "pytest"
 ]
+docs = [
+  "sphinx>=7.0",
+  "sphinx-autodoc-typehints",
+  "sphinx-copybutton",
+  "pydata-sphinx-theme",
+  "myst-parser",
+]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]

@@ -16,6 +16,8 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+  "typer>=0.12.5",
+  "pre-commit>=4.0.0",
   {include-group = "lint"},
   {include-group = "test"},
 ]
@@ -46,8 +48,19 @@ version-file = "src/ezmsg/blackrock/__version__.py"
 [tool.hatch.build.targets.wheel]
 packages = ["src/ezmsg"]
 
-[tool.uv]
-dev-dependencies = [
-    "ruff>=0.6.8",
-    "typer>=0.12.5",
-]
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+# Exclude auto-generated files
+exclude = ["*/__version__.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ezmsg.package"]
+known-third-party = ["ezmsg"]

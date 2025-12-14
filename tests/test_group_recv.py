@@ -1,16 +1,16 @@
 import json
 import os
-from pathlib import Path
-import pytest
 import time
 import typing
+from pathlib import Path
 
 import ezmsg.core as ez
-from ezmsg.util.terminate import TerminateOnTotal
-import ezmsg.util.messagelogger as ml
 import ezmsg.util.messagecodec as mc
-from ezmsg.util.messagecodec import MessageEncoder, LogStart
+import ezmsg.util.messagelogger as ml
 import numpy as np
+import pytest
+from ezmsg.util.messagecodec import LogStart
+from ezmsg.util.terminate import TerminateOnTotal
 
 from ezmsg.blackrock.nsp import NSPSource
 
@@ -67,18 +67,10 @@ def test_latency():
     test_path.unlink(missing_ok=True)
 
     # Create data array; sub_time, dev_time, samp_count
-    data = np.array(
-        [
-            [_["ts"], _["obj"]["ts"], _["obj"]["samps"]]
-            for _ in log_data
-            if "obj" in _ and "ts" in _["obj"]
-        ]
-    )
+    data = np.array([[_["ts"], _["obj"]["ts"], _["obj"]["samps"]] for _ in log_data if "obj" in _ and "ts" in _["obj"]])
 
     sub_time = data[:, 0]  # Time at the subscriber (PC clock)
-    dev_time = data[
-        :, 1
-    ]  # Estimated time (PC clock) when the first sample in the chunk left the device.
+    dev_time = data[:, 1]  # Estimated time (PC clock) when the first sample in the chunk left the device.
     samp_count = data[:, 2]  # Number of samples in this chunk.
     expected_time = dev_time + samp_count / 30_000
     latency = sub_time - expected_time

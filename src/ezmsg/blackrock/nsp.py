@@ -1,16 +1,15 @@
 import asyncio
-from ctypes import Structure
 import functools
 import typing
+from ctypes import Structure
 
-import numpy as np
-from pycbsdk import cbsdk, cbhw
 import ezmsg.core as ez
-from ezmsg.util.messages.axisarray import AxisArray, replace
+import numpy as np
 from ezmsg.event.message import EventMessage
+from ezmsg.util.messages.axisarray import AxisArray, replace
+from pycbsdk import cbhw, cbsdk
 
 from .util import ClockSync
-
 
 grp_fs = {1: 500, 2: 1_000, 3: 2_000, 4: 10_000, 5: 30_000, 6: 30_000}
 
@@ -48,9 +47,7 @@ class NSPSourceState(ez.State):
     }
     cont_read_idx = {_: 0 for _ in range(1, 7)}
     cont_write_idx = {_: 0 for _ in range(1, 7)}
-    template_cont = {
-        _: AxisArray(data=np.array([[]]), dims=["time", "ch"]) for _ in range(1, 7)
-    }
+    template_cont = {_: AxisArray(data=np.array([[]]), dims=["time", "ch"]) for _ in range(1, 7)}
     scale_cont = {_: np.array([]) for _ in range(1, 7)}
     sysfreq: int = 30_000  # Default for pre-Gemini system
     n_channels: int = 0
@@ -115,16 +112,12 @@ class NSPSource(ez.Unit):
         for ch_idx in chanset:
             pkt: cbhw.packet.packets.CBPacketChanInfo = config["channel_infos"][ch_idx]
             chan_labels.append(pkt.label.decode("utf-8"))
-            scale_fac = (pkt.scalin.anamax - pkt.scalin.anamin) / (
-                pkt.scalin.digmax - pkt.scalin.digmin
-            )
+            scale_fac = (pkt.scalin.anamax - pkt.scalin.anamin) / (pkt.scalin.digmax - pkt.scalin.digmin)
             if pkt.scalin.anaunit.decode("utf-8") == "mV":
                 scale_fac /= 1000
             scale_factors.append(scale_fac)
 
-        ch_ax = AxisArray.CoordinateAxis(
-            data=np.array(chan_labels), dims=["ch"], unit="label"
-        )
+        ch_ax = AxisArray.CoordinateAxis(data=np.array(chan_labels), dims=["ch"], unit="label")
         self.STATE.template_cont[grp_idx] = AxisArray(
             np.zeros((0, 0)),
             dims=["time", "ch"],
@@ -154,9 +147,7 @@ class NSPSource(ez.Unit):
             await asyncio.sleep(1.0)
             if self.STATE.device is not None:
                 monitor_state = self.STATE.device.get_monitor_state()
-                self._clock_sync.add_pair(
-                    monitor_state["time"], monitor_state["sys_time"]
-                )
+                self._clock_sync.add_pair(monitor_state["time"], monitor_state["sys_time"])
 
     @ez.publisher(OUTPUT_SIGNAL)
     async def pub_cont(self) -> typing.AsyncGenerator:

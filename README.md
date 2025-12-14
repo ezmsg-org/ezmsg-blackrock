@@ -11,11 +11,16 @@ Interface for Blackrock Cerebus ecosystem (incl. Neuroport) using `pycbsdk`
 * `pycbsdk` 
 * `ezmsg-event`
 
-## Setup (Development)
+## Development
 
-1. Install `ezmsg` either using `pip install ezmsg` or set up the repo for development as described in the `ezmsg` readme.
-2. `cd` to this directory and run `pip install -e .`
-3. Blackrock components are available under `import ezmsg.blackrock`
+We use [`uv`](https://docs.astral.sh/uv/getting-started/installation/) for development.
+
+1. Install [`uv`](https://docs.astral.sh/uv/getting-started/installation/) if not already installed.
+2. Fork this repository and clone your fork locally.
+3. Open a terminal and `cd` to the cloned folder.
+4. Run `uv sync` to create a `.venv` and install dependencies.
+5. (Optional) Install pre-commit hooks: `uv run pre-commit install`
+6. After making changes, run the test suite: `uv run pytest tests`
 
 ## Setup Notes
 

@@ -7,6 +7,9 @@ on:
   pull_request:
     branches:
       - main
+      - dev
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -24,9 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y graphviz
+        with:
+          fetch-depth: 0  # Needed for hatch-vcs to determine version
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
@@ -34,7 +36,7 @@ jobs:
           enable-cache: true
           python-version: "3.12"
 
-      - name: Install documentation dependencies
+      - name: Install the project
         run: uv sync --only-group docs
 
       - name: Build documentation
@@ -45,17 +47,14 @@ jobs:
       - name: Add .nojekyll file
         run: touch docs/build/html/.nojekyll
 
-      - name: Add CNAME file for custom domain
-        run: echo "www.ezmsg.org" > docs/build/html/CNAME
-
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: 'docs/build/html'
 
   deploy:
-    # Deploy on push to main
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Only deploy when a release is published
+    if: github.event_name == 'release'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

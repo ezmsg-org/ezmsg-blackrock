@@ -2,7 +2,7 @@
 name = "ezmsg-blackrock"
 description = "Blackrock Cerebus ecosystem interface for ezmsg"
 authors = [
-  { name = "Griffin Milsap", email = "chadwick.boulay@gmail.com" },
+  { name = "Griffin Milsap", email = "griffin.milsap@gmail.com" },
   { name = "Chadwick Boulay", email = "chadwick.boulay@gmail.com" },
 ]
 readme = "README.md"
@@ -62,5 +62,5 @@ exclude = ["*/__version__.py"]
 select = ["E", "F", "I", "W"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["ezmsg.package"]
-known-third-party = ["ezmsg"]
+known-first-party = ["ezmsg.blackrock"]
+known-third-party = ["ezmsg", "ezmsg.event"]

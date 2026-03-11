@@ -2,13 +2,18 @@
 
 Interface for Blackrock Cerebus ecosystem (incl. Neuroport) using `pycbsdk`
 
+> **Note:** This is the final release series (v0.x) that uses the pure-Python
+> `pycbsdk` (v0.4.1). Starting with v1.0, `ezmsg-blackrock` will use the new
+> cffi-based `pycbsdk` built on CereLink/cbsdk. If you need the pure-Python
+> version, pin your dependency to `ezmsg-blackrock<1.0`.
+
 ## Installation
 `pip install ezmsg-blackrock`
 
 ## Dependencies
 
 * `python` >=3.10
-* `pycbsdk` 
+* `pycbsdk` == 0.4.1 (pure-Python; final supported version in this release series)
 * `ezmsg-event`
 
 ## Development

@@ -17,6 +17,16 @@ from pycbsdk import ChannelType, DeviceType, SampleRate, Session
 
 logger = logging.getLogger(__name__)
 
+CHANNEL_DTYPE = np.dtype(
+    [
+        ("x", "f4"),
+        ("y", "f4"),
+        ("label", "U16"),
+        ("bank", "U1"),
+        ("elec", "i4"),
+    ]
+)
+
 
 class CereLinkSettings(ez.Settings):
     device_type: DeviceType = DeviceType.NPLAY
@@ -72,6 +82,11 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
         for cmp_path, bank_offset in self.settings.channel_maps:
             self._session.load_channel_map(cmp_path, bank_offset)
 
+        # Pre-fetch channel positions (available after CCF/CMP loading)
+        all_ids = self._session.get_matching_channel_ids(ChannelType.FRONTEND)
+        all_pos = self._session.get_channels_positions(ChannelType.FRONTEND)
+        self._ch_positions: dict[int, tuple] = dict(zip(all_ids, all_pos))
+
         # Discover active groups and set up ring buffers + callbacks
         for rate in SampleRate:
             if rate == SampleRate.NONE:
@@ -100,11 +115,18 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
         fs = rate.hz
         buff_samples = max(1, int(self.settings.cont_buffer_dur * fs))
 
-        chan_labels = []
+        ch_info = np.zeros(n_ch, dtype=CHANNEL_DTYPE)
         scale_factors = []
-        for ch_id in channels:
+        for i, ch_id in enumerate(channels):
             label = self._session.get_channel_label(ch_id)
-            chan_labels.append(label or f"ch{ch_id}")
+            ch_info[i]["label"] = label or f"ch{ch_id}"
+
+            pos = self._ch_positions.get(ch_id, (0, 0, 0, 0))
+            ch_info[i]["x"] = pos[0]
+            ch_info[i]["y"] = pos[1]
+            ch_info[i]["bank"] = chr(ord("A") + pos[2] - 1) if pos[2] > 0 else ""
+            ch_info[i]["elec"] = pos[3]
+
             scaling = self._session.get_channel_scaling(ch_id)
             if scaling and scaling["digmax"] != scaling["digmin"]:
                 sf = (scaling["anamax"] - scaling["anamin"]) / (scaling["digmax"] - scaling["digmin"])
@@ -115,7 +137,7 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
                 scale_factors.append(1.0)
 
         time_ax = AxisArray.TimeAxis(fs, offset=0.0)
-        ch_ax = AxisArray.CoordinateAxis(data=np.array(chan_labels), dims=["ch"], unit="label")
+        ch_ax = AxisArray.CoordinateAxis(data=ch_info, dims=["ch"], unit="struct")
         template = AxisArray(
             np.zeros((0, 0)),
             dims=["time", "ch"],

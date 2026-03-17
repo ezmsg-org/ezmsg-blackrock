@@ -11,11 +11,12 @@ import numpy as np
 import pytest
 from ezmsg.util.messagecodec import LogStart
 from ezmsg.util.terminate import TerminateOnTotal
+from pycbsdk import DeviceType
 
-from ezmsg.blackrock.nsp import NSPSource
+from ezmsg.blackrock.cerelink import CereLinkSettings, CereLinkSource
 
 
-class MyEncoder(mc.MessageEncoder):  # json.JSONEncoder):
+class MyEncoder(mc.MessageEncoder):
     def default(self, obj: typing.Any) -> typing.Any:
         if type(obj) is LogStart:
             return {}
@@ -25,7 +26,6 @@ class MyEncoder(mc.MessageEncoder):  # json.JSONEncoder):
 
 # Monkey patch the log_object method to use our custom encoder.
 def handle_log_object(obj: typing.Any) -> str:
-    """Custom log_object function to use high-resolution timestamps."""
     return json.dumps({"ts": time.time(), "obj": obj}, cls=MyEncoder)
 
 
@@ -38,13 +38,12 @@ IN_GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
 def test_latency():
     test_path = Path().home() / "test_latency.log"
     comps = {
-        "SOURCE": NSPSource(
-            inst_addr="192.168.137.200",
-            inst_port=51002,
-            client_addr="",
-            protocol="4.1",
-            microvolts=False,
-            cbtime=False,
+        "SOURCE": CereLinkSource(
+            CereLinkSettings(
+                device_type=DeviceType.HUB1,
+                microvolts=False,
+                cbtime=False,
+            )
         ),
         "LOGGER": ml.MessageLogger(output=test_path, write_period=1.0),
         "TERM": TerminateOnTotal(total=10_000),
@@ -64,14 +63,13 @@ def test_latency():
             except json.JSONDecodeError:
                 continue
     test_path.unlink(missing_ok=True)
-    test_path.unlink(missing_ok=True)
 
     # Create data array; sub_time, dev_time, samp_count
     data = np.array([[_["ts"], _["obj"]["ts"], _["obj"]["samps"]] for _ in log_data if "obj" in _ and "ts" in _["obj"]])
 
-    sub_time = data[:, 0]  # Time at the subscriber (PC clock)
-    dev_time = data[:, 1]  # Estimated time (PC clock) when the first sample in the chunk left the device.
-    samp_count = data[:, 2]  # Number of samples in this chunk.
+    sub_time = data[:, 0]
+    dev_time = data[:, 1]
+    samp_count = data[:, 2]
     expected_time = dev_time + samp_count / 30_000
     latency = sub_time - expected_time
 

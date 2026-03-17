@@ -2,10 +2,11 @@
 
 Interface for Blackrock Cerebus ecosystem (incl. Neuroport) using `pycbsdk`
 
-> **Note:** This is the final release series (v0.x) that uses the pure-Python
-> `pycbsdk` (v0.4.1). Starting with v1.0, `ezmsg-blackrock` will use the new
-> cffi-based `pycbsdk` built on CereLink/cbsdk. If you need the pure-Python
-> version, pin your dependency to `ezmsg-blackrock<1.0`.
+> **Breaking change:** This version uses the new CFFI-based `pycbsdk` built on
+> [CereLink](https://github.com/CerebusOSS/CereLink) and is **not
+> backwards-compatible** with earlier releases. If you need the old pure-Python
+> `pycbsdk` (v0.4.1) version, use tag
+> [`v0.4.0`](https://github.com/CerebusOSS/ezmsg-blackrock/tree/v0.4.0).
 
 ## Installation
 `pip install ezmsg-blackrock`
@@ -13,8 +14,42 @@ Interface for Blackrock Cerebus ecosystem (incl. Neuroport) using `pycbsdk`
 ## Dependencies
 
 * `python` >=3.10
-* `pycbsdk` == 0.4.1 (pure-Python; final supported version in this release series)
+* `pycbsdk` (CFFI-based, from CereLink)
+* `ezmsg-baseproc` >=1.4.0
 * `ezmsg-event`
+
+## Quick start
+
+```python
+import ezmsg.core as ez
+from ezmsg.util.debuglog import DebugLog
+from ezmsg.blackrock import CereLinkSource, CereLinkSettings, DeviceType
+
+comps = {
+    "SRC": CereLinkSource(CereLinkSettings(device_type=DeviceType.NPLAY)),
+    "LOG": DebugLog(name="SIGNAL"),
+}
+conns = ((comps["SRC"].OUTPUT_SIGNAL, comps["LOG"].INPUT),)
+ez.run(components=comps, connections=conns)
+```
+
+### Channel configuration
+
+Before streaming continuous data you must configure which channels are
+sampling. Use the `pycbsdk` CLI utility:
+
+```bash
+# Enable all FRONTEND channels at 30 kHz raw rate
+python -m pycbsdk.cli.configure_channels --device NPLAY --rate RAW
+
+# Enable 96 channels at 30 kHz with DC coupling
+python -m pycbsdk.cli.configure_channels --rate 30kHz --n-chans 96 --dc-coupling
+
+# Disable all sampling
+python -m pycbsdk.cli.configure_channels --rate NONE
+```
+
+Or load a CCF configuration file via `CereLinkSettings(ccf_path="path/to/config.ccf")`.
 
 ## Development
 
@@ -53,13 +88,13 @@ Find the highest quality ethernet (yes, wired) network switch or router that you
         * Client PC -- `192.168.137.32` (Arbitrary address within subnet)
     * If using a network switch, configure the network adapters on the Central PC and Client PC to the aforementioned IP addresses
 1. At this point, it's handy to make sure you can ping the NSP and Client PC from the Central PC and that you can ping the NSP and the Central PC from the Client PC.  Adjust firewall settings accordingly, enabling multicast UDP traffic on the ethernet adapters, and all TCP/UDP traffic on ports `51001` and `51002`.
-1. Download and install the Central Suite on the Central PC from the [Blackrock Support](https://blackrockneurotech.com/support/) site: 
+1. Download and install the Central Suite on the Central PC from the [Blackrock Support](https://blackrockneurotech.com/support/) site:
     * The public "Cerebus Central Suite" will not function with the FDA approved Neuroport system, which will instead require the "Neuroport Central Suite".  Acquiring this installer will require you to submit a ticket to Blackrock Support because the download is NOT public.
 
 #### Emulate an NSP (Useful for development without an NSP)
 
 It is possible to emulate Blackrock hardware while playing back previously recorded data using a software tool called "nPlayServer".
-The publicly-available and supported nPlayServer is only available on Windows but unsupported Mac and Linux binaries (x86 or ARM) are available. Open an issue to ask.  
+The publicly-available and supported nPlayServer is only available on Windows but unsupported Mac and Linux binaries (x86 or ARM) are available. Open an issue to ask.
 
 1. Power down the NSP if you already have it on the switch/router.
 1. Download and extract the "Real Sample Data" from the [Blackrock Support](https://blackrockneurotech.com/support/) site. Extract the `*.ns6` file somewhere memorable in the filesystem (like `Documents`)
@@ -70,19 +105,11 @@ The publicly-available and supported nPlayServer is only available on Windows bu
 If your intention is to only test on 'localhost' (i.e., ezmsg-blackrock and nPlayServer on the same machine), then there is nothing more to be done.
 However, if your intention is for the emulation PC to be a different machine than the client PC, nPlayServer must be configured to work over the network.
 
-1. Reconfigure the emulation host PC to have an IP address matching the emulated device (see addresses listed above). 
+1. Reconfigure the emulation host PC to have an IP address matching the emulated device (see addresses listed above).
 1. Right click the shortcut and go to "Properties".  Set the "Target" line to: `"C:\Program Files (x86)\Blackrock Microsystems\Neuroport Central Suite\nPlayServer.exe" --network bcast=192.168.137.255:51002 --network inst=192.168.137.128:51001 -L`, adjusting for the actual install path of your Central suite.
     * `bcast` address terminates in `.255` because that's the UDP multicast address.
     * `inst` address terminates in `.128` to emulate Legacy NSP. See the list above for Gemini hardware. Also, Gemini hardware requires the instrument port to be set to `51002`.
     * `-L` uses the last `.nsX` file for replay. You can also manually specify an `.nsX` file for replay, but be aware nothing will replay when using `-L` if you've never replayed a file using nPlayServer, or if that file has moved or no longer exists.
-
-### Software Setup
-
-* Use Central to set up the NSP hardware.
-* If running Central and `ezmsg-blackrock` on the same PC, shut down Central
-* Assuming `pycbsdk` is installed in your python environment (which it should be, considering it's a dependency of `ezmsg-blackrock` that automatically gets installed with a `pip install -e .`), you should have the `pycbsdk-rates` command on your path.  Test the connection and hardware/software setup using `pycbsdk-rates --inst_addr 192.168.137.128 --inst_port 51001 --protocol 3.11`
-    * Note that this command line is for Legacy NSP with hard-coded address `192.168.137.128` running on port 51001
-    * Also note that network protocol is not automatically detected.  Our old hardware can only be updated to firmware `7.0.6` which uses hardware library/protocol `3.11`.  This can be checked by opening Central and navigating to "About Central" which will tell you which hardware library the firmware is running (assuming your NSP's firmware and Central version match). As of this writing, most Gemini hardware should be using protocol 4.1 (default).
 
 ### Troubleshooting
 
@@ -91,4 +118,4 @@ However, if your intention is for the emulation PC to be a different machine tha
 * Make sure the Central PC and the Client PC can ping each other and the NSP.
 * Ensure NSP Firmware matches Central version.
 * Ensure the protocol version you specify matches the firmware's protocol version.
-* `pycbsdk-rates` and Wireshark + [a dissector](https://github.com/CerebusOSS/CerebusWireshark) are your friends. Godspeed.
+* `python -m pycbsdk.cli.scan_devices` and Wireshark + [a dissector](https://github.com/CerebusOSS/CerebusWireshark) are your friends. Godspeed.

@@ -147,7 +147,7 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
         )
 
         buf = {
-            "timestamps": np.zeros(buff_samples, dtype=np.int64),
+            "timestamps": np.zeros(buff_samples, dtype=np.uint64),
             "data": np.zeros((buff_samples, n_ch), dtype=np.int16),
             "write_idx": 0,
             "read_idx": 0,
@@ -159,17 +159,28 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
         self._buffers[rate_int] = buf
         self._active_rates.append(rate_int)
 
-        @self._session.on_group(rate, as_array=True)
-        def _on_group(header, samples, _buf=buf):
-            self._handle_group(header, samples, _buf)
+        @self._session.on_group_batch(rate)
+        def _on_group_batch(samples, timestamps, _buf=buf):
+            self._handle_group_batch(samples, timestamps, _buf)
 
     # -- Callbacks (run in C/receive thread) --
 
-    def _handle_group(self, header, samples: np.ndarray, buf: dict) -> None:
+    def _handle_group_batch(self, samples: np.ndarray, timestamps: np.ndarray, buf: dict) -> None:
         w = buf["write_idx"]
-        buf["data"][w, :] = samples
-        buf["timestamps"][w] = header.time
-        buf["write_idx"] = (w + 1) % len(buf["timestamps"])
+        n = len(timestamps)
+        buff_len = len(buf["timestamps"])
+        end = w + n
+        if end <= buff_len:
+            buf["data"][w:end, :] = samples
+            buf["timestamps"][w:end] = timestamps
+        else:
+            first = buff_len - w
+            buf["data"][w:buff_len, :] = samples[:first]
+            buf["timestamps"][w:buff_len] = timestamps[:first]
+            rest = n - first
+            buf["data"][:rest, :] = samples[first:]
+            buf["timestamps"][:rest] = timestamps[first:]
+        buf["write_idx"] = end % buff_len
         if self._loop is not None and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._data_event.set)
         else:

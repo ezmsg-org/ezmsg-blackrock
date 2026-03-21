@@ -26,7 +26,7 @@ class MyEncoder(mc.MessageEncoder):
 
 # Monkey patch the log_object method to use our custom encoder.
 def handle_log_object(obj: typing.Any) -> str:
-    return json.dumps({"ts": time.time(), "obj": obj}, cls=MyEncoder)
+    return json.dumps({"ts": time.monotonic(), "obj": obj}, cls=MyEncoder)
 
 
 ml.log_object = handle_log_object

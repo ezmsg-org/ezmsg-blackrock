@@ -32,8 +32,8 @@ class CereLinkSettings(ez.Settings):
     device_type: DeviceType = DeviceType.NPLAY
     """Device type to connect to."""
 
-    cbtime: bool = True
-    """True = raw device nanoseconds, False = time.monotonic() via clock sync."""
+    cbtime: bool = False
+    """True = raw device nanoseconds/1e9, False = time.monotonic() via clock sync."""
 
     microvolts: bool = True
     """Convert int16 → µV using channel scale factors (when available)."""

@@ -102,6 +102,7 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
                 self.settings.n_chans,
                 self.settings.channel_type,
                 self.settings.sample_rate,
+                disable_others=True,
             )
 
         if self.settings.cmp_path:

@@ -42,10 +42,29 @@ class CereLinkSettings(ez.Settings):
     """Ring buffer duration in seconds per sample rate group."""
 
     ccf_path: str | None = None
-    """CCF file to load after connection (or None to skip)."""
+    """CCF file to load after connection (or None to skip).
+    Mutually exclusive with n_chans/sample_rate."""
 
-    channel_maps: tuple[tuple[str, int], ...] = ()
-    """List of (cmp_path, bank_offset) pairs for multi-array setups."""
+    cmp_path: str | None = None
+    """CMP file for electrode positions (or None to skip). Bank offset is always 0."""
+
+    n_chans: int | None = None
+    """Number of channels to enable (used with channel_type and sample_rate).
+    Mutually exclusive with ccf_path."""
+
+    channel_type: ChannelType = ChannelType.FRONTEND
+    """Channel type filter for programmatic setup."""
+
+    sample_rate: SampleRate | None = None
+    """Sample rate for programmatic setup (e.g. SampleRate.SR_30kHz).
+    Mutually exclusive with ccf_path."""
+
+    def __post_init__(self):
+        has_manual = self.n_chans is not None or self.sample_rate is not None
+        if self.ccf_path is not None and has_manual:
+            raise ValueError("ccf_path and n_chans/sample_rate are mutually exclusive")
+        if (self.n_chans is None) != (self.sample_rate is None):
+            raise ValueError("n_chans and sample_rate must both be set or both be None")
 
 
 class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
@@ -78,9 +97,15 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
 
         if self.settings.ccf_path:
             self._session.load_ccf(self.settings.ccf_path)
+        elif self.settings.n_chans is not None and self.settings.sample_rate is not None:
+            self._session.set_channel_sample_group(
+                self.settings.n_chans,
+                self.settings.channel_type,
+                self.settings.sample_rate,
+            )
 
-        for cmp_path, bank_offset in self.settings.channel_maps:
-            self._session.load_channel_map(cmp_path, bank_offset)
+        if self.settings.cmp_path:
+            self._session.load_channel_map(self.settings.cmp_path, 0)
 
         # Pre-fetch channel positions (available after CCF/CMP loading)
         all_ids = self._session.get_matching_channel_ids(ChannelType.FRONTEND)

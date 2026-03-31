@@ -191,6 +191,9 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
     # -- Callbacks (run in C/receive thread) --
 
     def _handle_group_batch(self, samples: np.ndarray, timestamps: np.ndarray, buf: dict) -> None:
+        n_ch = buf["n_channels"]
+        if samples.shape[1] > n_ch:
+            samples = samples[:, :n_ch]  # trim dword-padding columns
         w = buf["write_idx"]
         n = len(timestamps)
         buff_len = len(buf["timestamps"])

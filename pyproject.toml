@@ -12,7 +12,7 @@ dependencies = [
     "ezmsg-baseproc>=1.4.0",
     "ezmsg-event",
     "ezmsg>=3.6.1",
-    "pycbsdk>=9.2.0",
+    "pycbsdk>=9.3.0",
 ]
 
 [dependency-groups]
@@ -26,7 +26,8 @@ lint = [
   "ruff"
 ]
 test = [
-  "pytest"
+  "pytest",
+  "pytest-timeout",
 ]
 docs = [
   "sphinx>=7.0",
@@ -52,6 +53,9 @@ packages = ["src/ezmsg"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: tests requiring a running nPlayServer instance",
+]
 
 [tool.ruff]
 line-length = 120

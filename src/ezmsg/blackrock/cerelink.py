@@ -63,8 +63,8 @@ class CereLinkSettings(ez.Settings):
         has_manual = self.n_chans is not None or self.sample_rate is not None
         if self.ccf_path is not None and has_manual:
             raise ValueError("ccf_path and n_chans/sample_rate are mutually exclusive")
-        if (self.n_chans is None) != (self.sample_rate is None):
-            raise ValueError("n_chans and sample_rate must both be set or both be None")
+        if self.n_chans is not None and self.sample_rate is None:
+            raise ValueError("sample_rate is required when n_chans is set")
 
 
 class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
@@ -97,9 +97,12 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
 
         if self.settings.ccf_path:
             self._session.load_ccf(self.settings.ccf_path)
-        elif self.settings.n_chans is not None and self.settings.sample_rate is not None:
+        elif self.settings.sample_rate is not None:
+            n_chans = self.settings.n_chans
+            if n_chans is None:
+                n_chans = len(self._session.get_matching_channel_ids(self.settings.channel_type))
             self._session.set_channel_sample_group(
-                self.settings.n_chans,
+                n_chans,
                 self.settings.channel_type,
                 self.settings.sample_rate,
                 disable_others=True,

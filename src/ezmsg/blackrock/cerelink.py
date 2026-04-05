@@ -96,7 +96,7 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
             time.sleep(0.1)
 
         if self.settings.ccf_path:
-            self._session.load_ccf(self.settings.ccf_path)
+            self._session.load_ccf_sync(self.settings.ccf_path)
         elif self.settings.sample_rate is not None:
             n_chans = self.settings.n_chans
             if n_chans is None:

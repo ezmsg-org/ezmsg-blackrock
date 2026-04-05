@@ -1,16 +1,12 @@
 """Integration tests requiring a running nPlayServer instance (4-channel data)."""
 
-import ast
-import base64
-import json
 import time
 from pathlib import Path
 
 import ezmsg.core as ez
 import numpy as np
 import pytest
-from conftest import run_nplayserver
-from ezmsg.util.messagecodec import NDARRAY_TYPE, PICKLE_TYPE, TYPE, LogStart, import_type
+from conftest import read_log, run_nplayserver
 from ezmsg.util.messagelogger import MessageLogger
 from ezmsg.util.terminate import TerminateOnTotal
 from pycbsdk import ChannelType, DeviceType, SampleRate
@@ -20,41 +16,6 @@ from ezmsg.blackrock.cerelink import CereLinkSettings, CereLinkSource
 pytestmark = pytest.mark.integration
 
 N_MESSAGES = 50
-
-
-def _object_hook(obj: dict) -> object:
-    """Like ezmsg's MessageDecoder hook, but handles structured numpy dtypes."""
-    obj_type = obj.get(TYPE)
-    if obj_type is None:
-        return obj
-    if obj_type == NDARRAY_TYPE:
-        dtype_str = obj.get("dtype", "")
-        try:
-            dtype = np.dtype(dtype_str)
-        except TypeError:
-            dtype = np.dtype(ast.literal_eval(dtype_str))
-        buf = base64.b64decode(obj["data"].encode("ascii"))
-        return np.frombuffer(buf, dtype=dtype).reshape(obj["shape"])
-    if obj_type == PICKLE_TYPE:
-        import pickle
-
-        buf = base64.b64decode(obj["data"].encode("ascii"))
-        return pickle.loads(buf)  # noqa: S301
-    cls = import_type(obj_type)
-    del obj[TYPE]
-    return cls(**obj)
-
-
-def _read_log(path: Path) -> list:
-    """Read a MessageLogger file, returning deserialized message objects."""
-    messages = []
-    with open(path) as f:
-        for line in f:
-            entry = json.loads(line, object_hook=_object_hook)
-            if isinstance(entry["obj"], LogStart):
-                continue
-            messages.append(entry["obj"])
-    return messages
 
 
 def _run_source(settings: CereLinkSettings, log_path: Path, n_messages: int = N_MESSAGES) -> list:
@@ -69,7 +30,7 @@ def _run_source(settings: CereLinkSettings, log_path: Path, n_messages: int = N_
         (comps["LOG"].OUTPUT_MESSAGE, comps["TERM"].INPUT_MESSAGE),
     )
     ez.run(components=comps, connections=conns)
-    return _read_log(log_path)
+    return read_log(log_path)
 
 
 @pytest.fixture(scope="module")

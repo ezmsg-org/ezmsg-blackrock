@@ -1,7 +1,10 @@
 """Shared test fixtures for ezmsg-blackrock."""
 
+import ast
+import base64
 import ctypes
 import ctypes.util
+import json
 import os
 import platform
 import subprocess
@@ -12,7 +15,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.request import urlretrieve
 
+import numpy as np
 import pytest
+from ezmsg.util.messagecodec import NDARRAY_TYPE, PICKLE_TYPE, TYPE, LogStart, import_type
 
 CERELINK_RELEASE_URL = "https://github.com/CerebusOSS/CereLink/releases/download/v9.3.0"
 CACHE_DIR = Path(__file__).parent / ".test_cache"
@@ -71,6 +76,41 @@ def _download_dataset(name: str) -> Path:
     _download(f"{CERELINK_RELEASE_URL}/{name}.zip", zip_path)
     _extract_zip(zip_path, extract_dir)
     return extract_dir
+
+
+def _object_hook(obj: dict) -> object:
+    """JSON object hook that handles structured numpy dtypes."""
+    obj_type = obj.get(TYPE)
+    if obj_type is None:
+        return obj
+    if obj_type == NDARRAY_TYPE:
+        dtype_str = obj.get("dtype", "")
+        try:
+            dtype = np.dtype(dtype_str)
+        except TypeError:
+            dtype = np.dtype(ast.literal_eval(dtype_str))
+        buf = base64.b64decode(obj["data"].encode("ascii"))
+        return np.frombuffer(buf, dtype=dtype).reshape(obj["shape"])
+    if obj_type == PICKLE_TYPE:
+        import pickle
+
+        buf = base64.b64decode(obj["data"].encode("ascii"))
+        return pickle.loads(buf)  # noqa: S301
+    cls = import_type(obj_type)
+    del obj[TYPE]
+    return cls(**obj)
+
+
+def read_log(path: Path) -> list:
+    """Read a MessageLogger file, returning deserialized message objects."""
+    messages = []
+    with open(path) as f:
+        for line in f:
+            entry = json.loads(line, object_hook=_object_hook)
+            if isinstance(entry["obj"], LogStart):
+                continue
+            messages.append(entry["obj"])
+    return messages
 
 
 @contextmanager
@@ -141,6 +181,28 @@ def ccf_256_path(test_data_dir_256: Path) -> Path:
     """Path to the .ccf file in the 256-channel test data."""
     matches = list(test_data_dir_256.rglob("*.ccf"))
     assert matches, "No .ccf file found in 256-channel test data"
+    return matches[0]
+
+
+@pytest.fixture(scope="session")
+def test_data_impedance() -> Path:
+    """Download and extract impedance test data (cplxe_dnss_impedance.zip)."""
+    return _download_dataset("cplxe_dnss_impedance")
+
+
+@pytest.fixture(scope="session")
+def ns6_impedance_path(test_data_impedance: Path) -> Path:
+    """Path to the .ns6 file in the impedance test data."""
+    matches = list(test_data_impedance.rglob("*.ns6"))
+    assert matches, "No .ns6 file found in impedance test data"
+    return matches[0]
+
+
+@pytest.fixture(scope="session")
+def ccf_impedance_path(test_data_impedance: Path) -> Path:
+    """Path to the .ccf file in the impedance test data."""
+    matches = list(test_data_impedance.rglob("*.ccf"))
+    assert matches, "No .ccf file found in impedance test data"
     return matches[0]
 
 

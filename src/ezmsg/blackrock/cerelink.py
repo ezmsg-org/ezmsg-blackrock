@@ -59,6 +59,9 @@ class CereLinkSettings(ez.Settings):
     """Sample rate for programmatic setup (e.g. SampleRate.SR_30kHz).
     Mutually exclusive with ccf_path."""
 
+    ac_input_coupling: bool = False
+    """AC input coupling (highpass filter). Ignored when ccf_path is provided."""
+
     def __post_init__(self):
         has_manual = self.n_chans is not None or self.sample_rate is not None
         if self.ccf_path is not None and has_manual:
@@ -96,7 +99,7 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
             time.sleep(0.1)
 
         if self.settings.ccf_path:
-            self._session.load_ccf(self.settings.ccf_path)
+            self._session.load_ccf_sync(self.settings.ccf_path)
         elif self.settings.sample_rate is not None:
             n_chans = self.settings.n_chans
             if n_chans is None:
@@ -106,6 +109,11 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
                 self.settings.channel_type,
                 self.settings.sample_rate,
                 disable_others=True,
+            )
+            self._session.set_ac_input_coupling(
+                n_chans,
+                self.settings.channel_type,
+                self.settings.ac_input_coupling,
             )
 
         if self.settings.cmp_path:

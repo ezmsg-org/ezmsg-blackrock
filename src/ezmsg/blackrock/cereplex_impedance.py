@@ -74,7 +74,29 @@ def extract_impedance(
     freq_hi: float,
     test_current_nA: float,
 ) -> float | None:
-    """Extract impedance (kOhm) from the 1 kHz component via FFT."""
+    """Extract impedance (kOhm) from the 1 kHz component via single-bin DFT.
+
+    Detrends the tail of the burst (skipping the settle transient), computes
+    the FFT, and extracts the peak-to-peak amplitude in the *freq_lo*--*freq_hi*
+    band. Impedance is ``V_p2p / I_peak``.
+
+    .. important::
+       *data* must be in **microvolts**. Passing raw ADC counts will produce
+       impedance values that are wrong by the ADC scale factor.
+       When using :class:`CereLinkSource`, set ``microvolts=True``.
+
+    Args:
+        data: 1-D array of samples for a single channel burst, in microvolts.
+        fft_samples: Number of samples (from the end of *data*) to use for the FFT.
+        fs: Sampling rate in Hz.
+        freq_lo: Lower bound of the extraction band (Hz).
+        freq_hi: Upper bound of the extraction band (Hz).
+        test_current_nA: Peak amplitude of the injected test current (nA).
+
+    Returns:
+        Impedance in kOhm, or ``None`` if *data* is too short or no energy
+        is found in the target band.
+    """
     if len(data) < fft_samples:
         return None
 
@@ -118,6 +140,22 @@ class CerePlexImpedanceProcessor(
         CerePlexImpedanceState,
     ]
 ):
+    """Stateful transformer that extracts per-channel impedance from a CerePlex sweep.
+
+    Expects a stream of ``AxisArray`` messages with dims ``["time", "ch"]``
+    where the data is in **microvolts**. When using :class:`CereLinkSource`,
+    set ``microvolts=True``; raw ADC counts will produce incorrect results.
+
+    The processor tracks one or more headstages independently (configured via
+    :attr:`CerePlexImpedanceSettings.headstage_channel_offsets`). Each
+    headstage's impedance sweep cycles sequentially through its channels:
+    exactly one channel is non-zero at a time while the others read zero.
+
+    On each impedance update the processor emits an ``AxisArray`` whose data
+    is a ``(1, n_ch)`` array of impedance values in kOhm (``NaN`` for channels
+    not yet measured).
+    """
+
     def _hash_message(self, message: AxisArray) -> int:
         ch_idx = message.dims.index("ch")
         n_ch = message.data.shape[ch_idx]

@@ -6,15 +6,16 @@ import time
 import numpy as np
 import pytest
 from conftest import run_nplayserver
-from pycbsdk import DeviceType
+from pycbsdk import ChannelType, DeviceType, SampleRate
 
 from ezmsg.blackrock.cerelink import CereLinkProducer, CereLinkSettings
 from ezmsg.blackrock.cereplex_impedance import CerePlexImpedanceProcessor, CerePlexImpedanceSettings
 
 pytestmark = pytest.mark.integration
 
-# Duration needed for a full 128-channel sweep (~100 ms/channel = 12.8 s).
-COLLECT_DURATION_S = 15.0
+# A full 128-channel sweep takes ~12.8 s (100 ms/channel).
+# Collect two full sweeps so the second pass overwrites partial-burst artifacts.
+COLLECT_DURATION_S = 30.0
 
 
 @pytest.fixture(scope="module")
@@ -24,12 +25,15 @@ def nplayserver(nplayserver_binary, ns6_impedance_path):
         yield proc
 
 
-def test_impedance_from_playback(nplayserver, ccf_impedance_path):
+def test_impedance_from_playback(nplayserver):
     """Play back real impedance data, run through the processor, verify values."""
     producer = CereLinkProducer(
         settings=CereLinkSettings(
             device_type=DeviceType.NPLAY,
-            ccf_path=str(ccf_impedance_path),
+            n_chans=128,
+            channel_type=ChannelType.FRONTEND,
+            sample_rate=SampleRate.SR_RAW,
+            ac_input_coupling=False,
             microvolts=True,
             cbtime=False,
         )

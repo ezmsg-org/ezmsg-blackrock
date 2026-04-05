@@ -186,21 +186,32 @@ class CerePlexImpedanceProcessor(
     # --- Per-headstage helpers ---
 
     def _complete_channel(self, hs: _HeadstageTracker) -> bool:
-        """FFT the buffered burst, store impedance, advance to next channel."""
+        """FFT the buffered burst, store impedance, advance to next channel.
+
+        Only updates the stored impedance if the burst contained enough
+        samples for a reliable FFT.  Truncated bursts (e.g. from a file-loop
+        boundary or impedance mode being disabled mid-sweep) are discarded
+        so they don't overwrite a previous good measurement.
+        """
         s = self.state
         settings = self.settings
-        imp = extract_impedance(
-            hs.buffer[: hs.buf_len],
-            s.fft_samples,
-            s.fs,
-            settings.freq_lo,
-            settings.freq_hi,
-            settings.test_current_nA,
-        )
         updated = False
-        if imp is not None:
-            s.impedance[hs.tracking_ch] = imp
-            updated = True
+        if hs.buf_len >= s.fft_samples:
+            imp = extract_impedance(
+                hs.buffer[: hs.buf_len],
+                s.fft_samples,
+                s.fs,
+                settings.freq_lo,
+                settings.freq_hi,
+                settings.test_current_nA,
+            )
+            if imp is not None:
+                # Only accept measurements from nearly complete bursts.
+                # Truncated bursts (from file-loop boundaries or impedance
+                # mode being disabled mid-sweep) produce unreliable values.
+                if hs.buf_len >= int(s.max_buffer_samples * 0.98):
+                    s.impedance[hs.tracking_ch] = imp
+                    updated = True
         n_hs = hs.ch_end - hs.ch_start
         local = hs.tracking_ch - hs.ch_start
         hs.tracking_ch = hs.ch_start + (local + 1) % n_hs

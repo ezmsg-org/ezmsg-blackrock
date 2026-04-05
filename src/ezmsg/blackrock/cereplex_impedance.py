@@ -206,12 +206,8 @@ class CerePlexImpedanceProcessor(
                 settings.test_current_nA,
             )
             if imp is not None:
-                # Only accept measurements from nearly complete bursts.
-                # Truncated bursts (from file-loop boundaries or impedance
-                # mode being disabled mid-sweep) produce unreliable values.
-                if hs.buf_len >= int(s.max_buffer_samples * 0.98):
-                    s.impedance[hs.tracking_ch] = imp
-                    updated = True
+                s.impedance[hs.tracking_ch] = imp
+                updated = True
         n_hs = hs.ch_end - hs.ch_start
         local = hs.tracking_ch - hs.ch_start
         hs.tracking_ch = hs.ch_start + (local + 1) % n_hs

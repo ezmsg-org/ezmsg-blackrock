@@ -58,7 +58,10 @@ def test_impedance_from_playback(nplayserver):
     assert impedance is not None
 
     measured = np.flatnonzero(~np.isnan(impedance))
-    assert len(measured) > 0, "No channels were measured"
+    # Looped playback means channels at the file boundary may not get a
+    # complete burst depending on timing.  In real-time use all 128 would
+    # be measured; with looped files, allow a few to be missed.
+    assert len(measured) >= 120, f"Too few channels measured: {len(measured)}/128"
 
     vals = impedance[measured]
     assert np.all(vals >= 180), f"Some impedances too low: min={vals.min():.1f} kOhm"

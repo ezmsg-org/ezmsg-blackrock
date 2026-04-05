@@ -185,6 +185,28 @@ def ccf_256_path(test_data_dir_256: Path) -> Path:
 
 
 @pytest.fixture(scope="session")
+def test_data_impedance() -> Path:
+    """Download and extract impedance test data (cplxe_dnss_impedance.zip)."""
+    return _download_dataset("cplxe_dnss_impedance")
+
+
+@pytest.fixture(scope="session")
+def ns6_impedance_path(test_data_impedance: Path) -> Path:
+    """Path to the .ns6 file in the impedance test data."""
+    matches = list(test_data_impedance.rglob("*.ns6"))
+    assert matches, "No .ns6 file found in impedance test data"
+    return matches[0]
+
+
+@pytest.fixture(scope="session")
+def ccf_impedance_path(test_data_impedance: Path) -> Path:
+    """Path to the .ccf file in the impedance test data."""
+    matches = list(test_data_impedance.rglob("*.ccf"))
+    assert matches, "No .ccf file found in impedance test data"
+    return matches[0]
+
+
+@pytest.fixture(scope="session")
 def cmp_path() -> Path:
     """Path to the bundled 96-channel CMP file."""
     p = Path(__file__).parent / "96ChannelDefaultMapping.cmp"

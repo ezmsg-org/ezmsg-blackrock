@@ -247,6 +247,10 @@ class CerePlexImpedanceProcessor(
             if not nz[first_nz]:
                 return n, False, False  # all zero — channel not active yet
             start = first_nz
+            if n_hs > 1 and next_col[start] != 0:
+                hs.tracking_ch = -1
+                hs.buf_len = 0
+                return n, True, False
 
         tail = col[start:]
         next_tail = next_col[start:]
@@ -256,6 +260,14 @@ class CerePlexImpedanceProcessor(
         first_zero = len(tail)
         if np.any(zeros):
             first_zero = int(np.argmax(zeros))
+
+        # Exclusivity check: if the next channel in sequence is non-zero
+        # while we're buffering, impedance mode was toggled off (or tracking
+        # is out of sync). Only meaningful with >1 channel per headstage.
+        if n_hs > 1 and first_zero > 0 and np.any(next_tail[:first_zero] != 0):
+            hs.tracking_ch = -1
+            hs.buf_len = 0
+            return start + first_zero, True, False
 
         # Buffer non-zero portion only
         space = s.max_buffer_samples - hs.buf_len

@@ -13,9 +13,10 @@ from ezmsg.blackrock.cereplex_impedance import CerePlexImpedanceProcessor, CereP
 
 pytestmark = pytest.mark.integration
 
+# IIRC, the file started with 5 seconds normal data before I switched to impedance mode.
 # A full 128-channel sweep takes ~12.8 s (100 ms/channel).
-# Collect two full sweeps so the second pass overwrites partial-burst artifacts.
-COLLECT_DURATION_S = 30.0
+# Thus, in the worst case, we need min 18 seconds to guarantee a full sweep.
+COLLECT_DURATION_S = 20.0
 
 
 @pytest.fixture(scope="module")

@@ -119,6 +119,8 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
         if self.settings.cmp_path:
             self._session.load_channel_map(self.settings.cmp_path, 0)
 
+        self._session.sync()
+
         # Pre-fetch channel positions (available after CCF/CMP loading)
         all_ids = self._session.get_matching_channel_ids(ChannelType.FRONTEND)
         all_pos = self._session.get_channels_positions(ChannelType.FRONTEND)

@@ -13,10 +13,11 @@ from ezmsg.blackrock.cereplex_impedance import CerePlexImpedanceProcessor, CereP
 
 pytestmark = pytest.mark.integration
 
-# IIRC, the file started with 5 seconds normal data before I switched to impedance mode.
+# The file starts with ~5s of normal data before impedance mode.
 # A full 128-channel sweep takes ~12.8 s (100 ms/channel).
-# Thus, in the worst case, we need min 18 seconds to guarantee a full sweep.
-COLLECT_DURATION_S = 20.0
+# The file loops, so we also lose ~5s of non-impedance data per loop.
+# 30s guarantees at least one complete sweep even in the worst alignment.
+COLLECT_DURATION_S = 30.0
 
 
 @pytest.fixture(scope="module")

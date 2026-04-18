@@ -1,6 +1,7 @@
 """Integration test for CerePlexImpedanceProcessor against real impedance playback data."""
 
 import asyncio
+import shutil
 import time
 
 import numpy as np
@@ -21,9 +22,17 @@ COLLECT_DURATION_S = 30.0
 
 
 @pytest.fixture(scope="module")
-def nplayserver(nplayserver_binary, ns6_impedance_path):
-    """nPlayServer playing back impedance test data for this module."""
-    with run_nplayserver(nplayserver_binary, ns6_impedance_path) as proc:
+def nplayserver(nplayserver_binary, ns6_impedance_path, tmp_path_factory):
+    """nPlayServer playing back impedance test data from an isolated dir.
+
+    The shared test-data cache holds multiple ``.ns6`` files in the same
+    directory; copying the target file into a fresh temp dir ensures
+    nPlayServer only sees the one we asked for.
+    """
+    isolated_dir = tmp_path_factory.mktemp("impedance_playback")
+    isolated_ns6 = isolated_dir / ns6_impedance_path.name
+    shutil.copy(ns6_impedance_path, isolated_ns6)
+    with run_nplayserver(nplayserver_binary, isolated_ns6) as proc:
         yield proc
 
 

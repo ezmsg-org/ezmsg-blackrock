@@ -29,6 +29,7 @@ lint = [
 test = [
   "pytest",
   "pytest-timeout",
+  "ezmsg-neo>=0.5.0",
 ]
 docs = [
   "sphinx>=7.0",

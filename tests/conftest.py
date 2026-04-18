@@ -192,15 +192,23 @@ def test_data_impedance() -> Path:
 
 @pytest.fixture(scope="session")
 def ns6_impedance_path(test_data_impedance: Path) -> Path:
-    """Path to the .ns6 file in the impedance test data."""
-    matches = list(test_data_impedance.rglob("*.ns6"))
-    assert matches, "No .ns6 file found in impedance test data"
+    """Single 128-ch CerePlex sweep (ships with a Central_impedances reference)."""
+    matches = list(test_data_impedance.rglob("Hub1-datafile002.ns6"))
+    assert matches, "Hub1-datafile002.ns6 not found in impedance test data"
+    return matches[0]
+
+
+@pytest.fixture(scope="session")
+def ns6_impedance_mixed_path(test_data_impedance: Path) -> Path:
+    """96-ch + 128-ch headstages + 32 disconnected channels on one hub."""
+    matches = list(test_data_impedance.rglob("Hub1-128002.ns6"))
+    assert matches, "Hub1-128002.ns6 not found in impedance test data"
     return matches[0]
 
 
 @pytest.fixture(scope="session")
 def ccf_impedance_path(test_data_impedance: Path) -> Path:
-    """Path to the .ccf file in the impedance test data."""
+    """Path to a .ccf file in the impedance test data."""
     matches = list(test_data_impedance.rglob("*.ccf"))
     assert matches, "No .ccf file found in impedance test data"
     return matches[0]

@@ -173,15 +173,26 @@ class CerePlexImpedanceProcessor(
         s.max_buffer_samples = int(settings.collect_duration_s * s.fs)
         s.fft_samples = int(settings.fft_duration_s * s.fs)
 
-        offsets = sorted(settings.headstage_channel_offsets)
+        self._build_trackers(n_ch)
+
+        s.impedance = np.full(n_ch, np.nan, dtype=np.float64)
+        s.ch_axis = message.axes.get("ch")
+
+    def _build_trackers(self, n_ch: int) -> None:
+        """Build per-headstage trackers from the current settings.
+
+        Split out from ``_reset_state`` so a settings update that only changes
+        ``headstage_channel_offsets`` can rebuild the tracker layout without
+        clearing the accumulated ``state.impedance`` array. Any in-flight
+        per-tracker burst buffer is discarded; new bursts buffer fresh.
+        """
+        s = self.state
+        offsets = sorted(self.settings.headstage_channel_offsets)
         s.trackers = []
         for i, start in enumerate(offsets):
             end = offsets[i + 1] if i + 1 < len(offsets) else n_ch
             buf = np.zeros(s.max_buffer_samples, dtype=np.float64)
             s.trackers.append(_HeadstageTracker(start, end, buf))
-
-        s.impedance = np.full(n_ch, np.nan, dtype=np.float64)
-        s.ch_axis = message.axes.get("ch")
 
     # --- Per-headstage helpers ---
 

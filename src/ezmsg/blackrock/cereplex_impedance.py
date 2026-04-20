@@ -9,6 +9,8 @@ Multiple headstages are tracked independently — each may be at a different poi
 in its impedance sweep.
 """
 
+import dataclasses
+import logging
 import typing
 
 import ezmsg.core as ez
@@ -16,6 +18,8 @@ import numpy as np
 import scipy.signal as ss
 from ezmsg.baseproc import BaseStatefulTransformer, BaseTransformerUnit, processor_state
 from ezmsg.util.messages.axisarray import AxisArray, replace
+
+logger = logging.getLogger(__name__)
 
 
 class CerePlexImpedanceSettings(ez.Settings):
@@ -173,15 +177,26 @@ class CerePlexImpedanceProcessor(
         s.max_buffer_samples = int(settings.collect_duration_s * s.fs)
         s.fft_samples = int(settings.fft_duration_s * s.fs)
 
-        offsets = sorted(settings.headstage_channel_offsets)
+        self._build_trackers(n_ch)
+
+        s.impedance = np.full(n_ch, np.nan, dtype=np.float64)
+        s.ch_axis = message.axes.get("ch")
+
+    def _build_trackers(self, n_ch: int) -> None:
+        """Build per-headstage trackers from the current settings.
+
+        Split out from ``_reset_state`` so a settings update that only changes
+        ``headstage_channel_offsets`` can rebuild the tracker layout without
+        clearing the accumulated ``state.impedance`` array. Any in-flight
+        per-tracker burst buffer is discarded; new bursts buffer fresh.
+        """
+        s = self.state
+        offsets = sorted(self.settings.headstage_channel_offsets)
         s.trackers = []
         for i, start in enumerate(offsets):
             end = offsets[i + 1] if i + 1 < len(offsets) else n_ch
             buf = np.zeros(s.max_buffer_samples, dtype=np.float64)
             s.trackers.append(_HeadstageTracker(start, end, buf))
-
-        s.impedance = np.full(n_ch, np.nan, dtype=np.float64)
-        s.ch_axis = message.axes.get("ch")
 
     # --- Per-headstage helpers ---
 
@@ -345,11 +360,17 @@ class CerePlexImpedanceProcessor(
         if n_time == 0:
             return None
 
+        # Capture if ch_axis changed for later emission even if no update
+        incoming_ch = message.axes.get("ch")
+        ch_axis_changed = incoming_ch is not None and incoming_ch is not s.ch_axis
+        if ch_axis_changed:
+            s.ch_axis = incoming_ch
+
         any_updated = False
         for hs in s.trackers:
             any_updated |= self._process_headstage(data, n_time, hs)
 
-        if any_updated:
+        if any_updated or ch_axis_changed:
             time_ix = message.get_axis_idx("time")
             new_time_ax = replace(
                 message.axes["time"], offset=message.axes["time"].value(message.data.shape[time_ix] - 1)
@@ -371,3 +392,39 @@ class CerePlexImpedance(
     ]
 ):
     SETTINGS = CerePlexImpedanceSettings
+
+    @ez.subscriber(BaseTransformerUnit.INPUT_SETTINGS)
+    async def on_settings(self, msg: CerePlexImpedanceSettings) -> None:
+        """Apply new settings.
+
+        If only ``headstage_channel_offsets`` changed, rebuild the trackers in
+        place — the accumulated impedance values for previously-measured
+        channels remain valid. Any other change recreates the processor as
+        usual (state is reset on the next message).
+        """
+        old = self.SETTINGS
+        if old is not None and isinstance(old, CerePlexImpedanceSettings):
+            old_offsets = tuple(old.headstage_channel_offsets)
+            new_offsets = tuple(msg.headstage_channel_offsets)
+            offsets_changed = old_offsets != new_offsets
+            # For the "everything else matches" check, normalise the offsets
+            # field on both sides before comparing the full dataclasses.
+            old_norm = dataclasses.replace(old, headstage_channel_offsets=new_offsets)
+            msg_norm = dataclasses.replace(msg, headstage_channel_offsets=new_offsets)
+            only_offsets = offsets_changed and old_norm == msg_norm
+        else:
+            only_offsets = False
+        self.apply_settings(msg)
+        proc = getattr(self, "processor", None)
+        state = getattr(proc, "state", None) if proc is not None else None
+        impedance = getattr(state, "impedance", None) if state is not None else None
+        if only_offsets and impedance is not None:
+            proc.settings = msg
+            proc._build_trackers(impedance.shape[0])
+            logger.info(
+                "CerePlexImpedance.on_settings: rebuilt trackers (offsets=%s); preserved %d impedance values.",
+                msg.headstage_channel_offsets,
+                impedance.shape[0],
+            )
+        else:
+            self.create_processor()

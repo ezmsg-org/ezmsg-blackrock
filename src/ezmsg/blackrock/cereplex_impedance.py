@@ -9,6 +9,7 @@ Multiple headstages are tracked independently — each may be at a different poi
 in its impedance sweep.
 """
 
+import logging
 import typing
 
 import ezmsg.core as ez
@@ -16,6 +17,8 @@ import numpy as np
 import scipy.signal as ss
 from ezmsg.baseproc import BaseStatefulTransformer, BaseTransformerUnit, processor_state
 from ezmsg.util.messages.axisarray import AxisArray, replace
+
+logger = logging.getLogger(__name__)
 
 
 class CerePlexImpedanceSettings(ez.Settings):
@@ -356,11 +359,17 @@ class CerePlexImpedanceProcessor(
         if n_time == 0:
             return None
 
+        # Capture if ch_axis changed for later emission even if no update
+        incoming_ch = message.axes.get("ch")
+        ch_axis_changed = incoming_ch is not None and incoming_ch is not s.ch_axis
+        if ch_axis_changed:
+            s.ch_axis = incoming_ch
+
         any_updated = False
         for hs in s.trackers:
             any_updated |= self._process_headstage(data, n_time, hs)
 
-        if any_updated:
+        if any_updated or ch_axis_changed:
             time_ix = message.get_axis_idx("time")
             new_time_ax = replace(
                 message.axes["time"], offset=message.axes["time"].value(message.data.shape[time_ix] - 1)

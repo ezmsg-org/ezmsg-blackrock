@@ -98,7 +98,10 @@ class TestCereLinkSource:
         )
         assert len(messages) >= N_MESSAGES
         offsets = [msg.axes["time"].offset for msg in messages]
-        assert all(offsets[i] <= offsets[i + 1] for i in range(len(offsets) - 1))
+        violations = [(i, offsets[i], offsets[i + 1]) for i in range(len(offsets) - 1) if offsets[i] > offsets[i + 1]]
+        assert not violations, (
+            f"non-monotonic at (idx, prev, next): {violations}; " f"offsets[0]={offsets[0]}, offsets[-1]={offsets[-1]}"
+        )
 
     def test_all_channels(self, nplayserver, tmp_path):
         n_ch = 4

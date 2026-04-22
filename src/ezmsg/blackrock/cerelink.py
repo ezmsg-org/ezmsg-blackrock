@@ -123,55 +123,61 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
         self._session = Session(device_type=self.settings.device_type)
         self._session.__enter__()
 
-        deadline = time.monotonic() + 10.0
-        while not self._session.running:
-            if time.monotonic() > deadline:
-                self._session.__exit__(None, None, None)
-                self._session = None
-                raise TimeoutError("Session did not start within 10 seconds")
-            time.sleep(0.1)
+        # Past this point the Session owns ~8 POSIX fds (6 shm + 1 sem + 1 UDP
+        # in STANDALONE mode). Any exception below must release them, or we
+        # orphan the fds for the life of the process.
+        try:
+            deadline = time.monotonic() + 10.0
+            while not self._session.running:
+                if time.monotonic() > deadline:
+                    raise TimeoutError("Session did not start within 10 seconds")
+                time.sleep(0.1)
 
-        if self.settings.ccf_path:
-            self._session.load_ccf_sync(self.settings.ccf_path)
-        elif self.settings.sample_rate is not None:
-            n_chans = self.settings.n_chans
-            if n_chans is None:
-                n_chans = len(self._session.get_matching_channel_ids(self.settings.channel_type))
-            self._session.set_channel_sample_group(
-                n_chans,
-                self.settings.channel_type,
-                self.settings.sample_rate,
-                disable_others=True,
-            )
-            self._session.set_ac_input_coupling(
-                n_chans,
-                self.settings.channel_type,
-                self.settings.ac_input_coupling,
-            )
+            if self.settings.ccf_path:
+                self._session.load_ccf_sync(self.settings.ccf_path)
+            elif self.settings.sample_rate is not None:
+                n_chans = self.settings.n_chans
+                if n_chans is None:
+                    n_chans = len(self._session.get_matching_channel_ids(self.settings.channel_type))
+                self._session.set_channel_sample_group(
+                    n_chans,
+                    self.settings.channel_type,
+                    self.settings.sample_rate,
+                    disable_others=True,
+                )
+                self._session.set_ac_input_coupling(
+                    n_chans,
+                    self.settings.channel_type,
+                    self.settings.ac_input_coupling,
+                )
 
-        if self.settings.cmp_path:
-            self._session.load_channel_map(self.settings.cmp_path, 0)
+            if self.settings.cmp_path:
+                self._session.load_channel_map(self.settings.cmp_path, 0)
 
-        self._session.sync()
+            self._session.sync()
 
-        # Pre-fetch channel positions (available after CCF/CMP loading)
-        all_ids = self._session.get_matching_channel_ids(ChannelType.FRONTEND)
-        all_pos = self._session.get_channels_positions(ChannelType.FRONTEND)
-        self._ch_positions: dict[int, tuple] = dict(zip(all_ids, all_pos))
+            # Pre-fetch channel positions (available after CCF/CMP loading)
+            all_ids = self._session.get_matching_channel_ids(ChannelType.FRONTEND)
+            all_pos = self._session.get_channels_positions(ChannelType.FRONTEND)
+            self._ch_positions: dict[int, tuple] = dict(zip(all_ids, all_pos))
 
-        # Discover active groups and set up ring buffers + callbacks
-        for rate in SampleRate:
-            if rate == SampleRate.NONE:
-                continue
-            channels = self._session.get_group_channels(int(rate))
-            if not channels:
-                continue
-            self._setup_group(rate, channels)
+            # Discover active groups and set up ring buffers + callbacks
+            for rate in SampleRate:
+                if rate == SampleRate.NONE:
+                    continue
+                channels = self._session.get_group_channels(int(rate))
+                if not channels:
+                    continue
+                self._setup_group(rate, channels)
 
-        # Spike callback
-        @self._session.on_event(ChannelType.FRONTEND)
-        def _on_spike(header, data):
-            self._handle_spike(header)
+            # Spike callback
+            @self._session.on_event(ChannelType.FRONTEND)
+            def _on_spike(header, data):
+                self._handle_spike(header)
+        except BaseException:
+            self._session.__exit__(None, None, None)
+            self._session = None
+            raise
 
     def close(self) -> None:
         """Tear down the Session and unblock any in-flight ``_produce``.
@@ -422,6 +428,10 @@ class CereLinkSource(BaseProducerUnit[CereLinkSettings, AxisArray, CereLinkProdu
             self._start_producer()
         except Exception as exc:
             logger.exception("CereLinkSource.initialize: startup open() failed")
+            try:
+                self.producer.close()
+            except Exception:
+                logger.exception("CereLinkSource.initialize: cleanup close() failed")
             self._status_queue.put_nowait(
                 DeviceStatus(device_type=self.SETTINGS.device_type, success=False, error=str(exc))
             )

@@ -3,7 +3,7 @@
 The CerePlex headstage injects a 1 kHz, 1 nA sine wave for 100 ms per channel,
 cycling sequentially through all channels.  Channels not under test read exactly
 zero (filters must be disabled).  Impedance is extracted via single-bin DFT at
-1 kHz: Z(kOhm) = V_peak(uV) / I_peak(nA).
+1 kHz: Z(kOhm) = V_peak_to_peak(uV) / I_peak_to_peak(nA).
 
 Multiple headstages are tracked independently — each may be at a different point
 in its impedance sweep.
@@ -78,11 +78,12 @@ def extract_impedance(
     freq_hi: float,
     test_current_nA: float,
 ) -> float | None:
-    """Extract impedance (kOhm) from the 1 kHz component via single-bin DFT.
+    """Extract impedance (kOhm) from the 1 kHz component via Hann-windowed DFT.
 
-    Detrends the tail of the burst (skipping the settle transient), computes
-    the FFT, and extracts the peak-to-peak amplitude in the *freq_lo*--*freq_hi*
-    band. Impedance is ``V_p2p / I_peak``.
+    Detrends the tail of the burst (skipping the settle transient), applies
+    a Hann window, computes the FFT, and sums the band-limited energy to
+    recover the peak amplitude of the injected test tone. Impedance is
+    ``V_p2p / I_p2p``.
 
     .. important::
        *data* must be in **microvolts**. Passing raw ADC counts will produce
@@ -93,9 +94,9 @@ def extract_impedance(
         data: 1-D array of samples for a single channel burst, in microvolts.
         fft_samples: Number of samples (from the end of *data*) to use for the FFT.
         fs: Sampling rate in Hz.
-        freq_lo: Lower bound of the extraction band (Hz).
-        freq_hi: Upper bound of the extraction band (Hz).
-        test_current_nA: Peak amplitude of the injected test current (nA).
+        freq_lo: Lower bound of frequency range for peak extraction (Hz).
+        freq_hi: Upper bound of frequency range for peak extraction (Hz).
+        test_current_nA: Peak-to-peak amplitude of the injected test current (nA).
 
     Returns:
         Impedance in kOhm, or ``None`` if *data* is too short or no energy
@@ -104,19 +105,50 @@ def extract_impedance(
     if len(data) < fft_samples:
         return None
 
-    # Use the tail of the burst (skip settle transient at the start)
+    # Use the tail of the burst (skip settle transient at the start).
     signal = data[-fft_samples:].astype(np.float64)
     signal = ss.detrend(signal, type="linear")
-    spectrum = np.fft.rfft(signal)
+
+    # Hann window: concentrates an off-bin tone's energy into a ~4-bin
+    # main lobe, so the band-sum amplitude estimate below doesn't under-
+    # report by up to 1/√2 for tones that straddle two rectangular bins.
+    window = np.hanning(fft_samples)
+    spectrum = np.fft.rfft(signal * window)
     freqs = np.fft.rfftfreq(fft_samples, d=1.0 / fs)
     mask = (freqs >= freq_lo) & (freqs <= freq_hi)
 
     if not np.any(mask):
         return None
 
-    amplitude = (2.0 / fft_samples) * np.sqrt(np.sum(np.abs(spectrum[mask]) ** 2))
+    # Power-integrated amplitude. Parseval gives, for a windowed pure tone
+    # of peak amplitude A whose main lobe fits inside the mask:
+    #
+    #     Σ_{rfft bins} |X_w|²  ≈  (N · A² / 4) · Σ w²
+    #
+    # Solving for A:  A = 2·√(Σ|X|²) / √(N · Σw²).
+    #
+    # For a rectangular window (Σw² = N) this reduces to the familiar
+    # ``(2/N)·√Σ|X|²``; for any other window the ``sum(w)``-style
+    # coherent-gain correction would be wrong by ``√(ENBW)``.
+    amplitude = (2.0 / np.sqrt(fft_samples * np.sum(window**2))) * np.sqrt(np.sum(np.abs(spectrum[mask]) ** 2))
     p2p = 2 * amplitude
     impedance_kohm = p2p / test_current_nA
+    # if impedance_kohm < 8 or impedance_kohm > 900:
+    #     import matplotlib.pyplot as plt
+    #
+    #     plt.subplot(2, 1, 1)
+    #     plt.plot(signal)
+    #     plt.xlabel("Sample")
+    #
+    #     plt.subplot(2, 1, 2)
+    #     ylim = np.max(np.abs(spectrum[mask]))
+    #     plt.semilogx(freqs, spectrum)
+    #     plt.xlabel("Frequency (Hz)")
+    #     plt.ylim([-ylim, ylim])
+    #
+    #     plt.tight_layout()
+    #     plt.suptitle(f"Impedance = {impedance_kohm:.2f} kOhm")
+    #     plt.show()
     return impedance_kohm if impedance_kohm > 0 else None
 
 
@@ -154,6 +186,11 @@ class CerePlexImpedanceProcessor(
     :attr:`CerePlexImpedanceSettings.headstage_channel_offsets`). Each
     headstage's impedance sweep cycles sequentially through its channels:
     exactly one channel is non-zero at a time while the others read zero.
+    This relies on the device's internal filtering being disabled — a filter
+    produces small non-zero residuals on idle channels, which defeats the
+    exact-zero exclusivity checks. Misconfiguration there is a sign that the
+    recording chain needs fixing, not that this algorithm should accommodate
+    it.
 
     On each impedance update the processor emits an ``AxisArray`` whose data
     is a ``(1, n_ch)`` array of impedance values in kOhm (``NaN`` for channels

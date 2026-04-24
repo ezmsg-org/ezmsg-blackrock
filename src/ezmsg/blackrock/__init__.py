@@ -7,6 +7,13 @@ from .cereplex_impedance import (
     CerePlexImpedanceProcessor,
     CerePlexImpedanceSettings,
 )
+from .channel_map import (
+    CHANNEL_DTYPE,
+    ChannelMapProcessor,
+    ChannelMapSettings,
+    ChannelMapUnit,
+    parse_cmp,
+)
 
 __all__ = [
     "__version__",
@@ -16,5 +23,10 @@ __all__ = [
     "CerePlexImpedance",
     "CerePlexImpedanceProcessor",
     "CerePlexImpedanceSettings",
+    "CHANNEL_DTYPE",
+    "ChannelMapProcessor",
+    "ChannelMapSettings",
+    "ChannelMapUnit",
     "DeviceType",
+    "parse_cmp",
 ]

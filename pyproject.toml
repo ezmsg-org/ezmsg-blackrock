@@ -9,7 +9,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
-    "ezmsg-baseproc>=1.4.0",
+    "ezmsg-baseproc>=1.8.0",
     "ezmsg-event",
     "ezmsg>=3.6.1",
     "pycbsdk>=9.6.1",

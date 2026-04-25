@@ -99,6 +99,14 @@ class CereLinkSettings(ez.Settings):
 class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
     """Owns the pycbsdk Session, ring buffers, and spike queue."""
 
+    # Documentary only: this is a non-stateful producer, and CereLinkSource
+    # overrides on_settings entirely (the lifecycle is async + multi-Session
+    # and doesn't fit BaseProducer.update_settings). The list still records
+    # which fields can change without any open()/close() reaction.
+    # cont_buffer_dur is intentionally NOT live-safe — it's consumed only in
+    # _setup_group during open() and changing it requires a session restart.
+    NONRESET_SETTINGS_FIELDS = frozenset({"cbtime", "microvolts"})
+
     def __init__(self, *args, settings: CereLinkSettings | None = None, **kwargs):
         super().__init__(*args, settings=settings, **kwargs)
         self._session: Session | None = None

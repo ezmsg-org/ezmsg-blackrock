@@ -158,6 +158,52 @@ class TestCerePlexImpedanceProcessor:
             assert not np.isnan(final[ch]), f"Channel {ch} unmeasured"
             assert final[ch] == pytest.approx(exp, rel=0.1)
 
+    def test_offsets_only_update_preserves_impedance(self):
+        """Changing only headstage_channel_offsets must not clear measured values."""
+        impedances = [50.0, 100.0, 200.0, 150.0]
+        data = self._build_sweep(impedances)
+        proc = CerePlexImpedanceProcessor(settings=CerePlexImpedanceSettings(headstage_channel_offsets=(0,)))
+        chunk_size = int(0.01 * FS)
+        offset = 0.0
+        for i in range(0, data.shape[0], chunk_size):
+            proc(_make_axis_array(data[i : i + chunk_size], offset=offset))
+            offset += chunk_size / FS
+
+        before = proc.state.impedance.copy()
+        assert not np.isnan(before).any()
+
+        proc.update_settings(CerePlexImpedanceSettings(headstage_channel_offsets=(0, 2)))
+
+        # Trackers re-laid out, but the accumulated impedance array survives.
+        assert proc._hash != -1, "offsets-only change must not arm a full reset"
+        np.testing.assert_array_equal(proc.state.impedance, before)
+        assert len(proc.state.trackers) == 2
+        assert proc.state.trackers[0].ch_start == 0 and proc.state.trackers[0].ch_end == 2
+        assert proc.state.trackers[1].ch_start == 2 and proc.state.trackers[1].ch_end == N_CH
+
+    def test_non_safe_field_arms_reset(self):
+        """A change to a field outside NONRESET_SETTINGS_FIELDS must queue a reset."""
+        proc = CerePlexImpedanceProcessor(settings=CerePlexImpedanceSettings())
+        # Warm up so _hash is set.
+        chunk = np.zeros((int(0.01 * FS), N_CH))
+        proc(_make_axis_array(chunk))
+        assert proc._hash != -1
+
+        # collect_duration_s is consumed in _reset_state -> requires reset.
+        proc.update_settings(CerePlexImpedanceSettings(collect_duration_s=0.2))
+        assert proc._hash == -1
+
+    def test_live_safe_field_does_not_reset(self):
+        """freq_lo/freq_hi/test_current_nA are read live; updating them must not reset."""
+        proc = CerePlexImpedanceProcessor(settings=CerePlexImpedanceSettings())
+        chunk = np.zeros((int(0.01 * FS), N_CH))
+        proc(_make_axis_array(chunk))
+        assert proc._hash != -1
+
+        proc.update_settings(CerePlexImpedanceSettings(freq_lo=900.0, freq_hi=1100.0, test_current_nA=2.0))
+        assert proc._hash != -1
+        assert proc.settings.test_current_nA == 2.0
+
     def test_unmeasured_channels_are_nan(self):
         """Channels that haven't been swept should remain NaN."""
         # Activate channel 0, then hand off to channel 1 briefly so ch0 completes,

@@ -1,15 +1,23 @@
 """Attach Blackrock ``.cmp`` channel-map metadata to an ``AxisArray``'s ``ch`` axis.
 
-Reads a single Blackrock Neurotech ``.cmp`` file and writes a structured
-``CoordinateAxis`` (``x``, ``y``, ``label``, ``bank``, ``elec``) onto the
-incoming message's ``ch`` axis. Any channels beyond the ones the CMP
-defines — e.g. a 256-channel stream played through a 128-channel CMP —
-get an auto-generated grid appended so downstream widgets always have a
-full set of coordinates to plot against.
+The output ``ch`` axis is a structured ``CoordinateAxis`` with fields
+``x``, ``y``, ``label``, ``bank``, ``elec`` for every input channel.
 
-One CMP per device: if you have a multi-headstage device, compose a
-single CMP file for the whole device rather than stitching multiple maps
-inside this unit.
+Each reset proceeds in three phases:
+
+1. **Base layer** — labels are pulled from the incoming ``ch`` axis. The
+   axis object is built once per ``n_ch`` and reused across resets so
+   successive CMP pushes accumulate into one composite map.
+2. **CMP overlay** — entries from :func:`pycbsdk.cmp.parse_cmp` are written
+   at indices ``chan_id - 1`` (with ``chan_id`` offset by ``start_chan``).
+   A companion ``cmp_mask`` records which indices were set so the auto-grid
+   pass can avoid them.
+3. **Auto-grid fill** — positions/bank/elec for indices NOT covered by the
+   CMP, laid out below and to the right of the CMP geometry so they don't
+   collide with CMP positions.
+
+Pushing ``filepath=None`` (or an empty path) clears the accumulated
+overlay so the next reset rebuilds the base from scratch.
 """
 
 import logging
@@ -20,6 +28,7 @@ import numpy as np
 from ezmsg.baseproc import BaseStatefulTransformer, BaseTransformerUnit, processor_state
 from ezmsg.util.messages.axisarray import AxisArray, CoordinateAxis
 from ezmsg.util.messages.util import replace
+from pycbsdk.cmp import parse_cmp
 
 logger = logging.getLogger(__name__)
 
@@ -34,114 +43,142 @@ CHANNEL_DTYPE = np.dtype(
 )
 
 
-def parse_cmp(path: str) -> list[tuple[int, int, str, int, str]]:
-    """Parse a Blackrock ``.cmp`` file.
-
-    Returns a list of ``(col, row, bank, electrode, label)`` tuples, one
-    per channel, in file order. *bank* is a single letter (typically
-    ``A`` – ``D``) drawn from the file itself.
-    """
-    entries: list[tuple[int, int, str, int, str]] = []
-    description_seen = False
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("//"):
-                continue
-            if not description_seen:
-                description_seen = True  # first non-comment line is description
-                continue
-            parts = line.split()
-            entries.append(
-                (
-                    int(parts[0]),  # col
-                    int(parts[1]),  # row
-                    parts[2],  # bank letter
-                    int(parts[3]),  # electrode
-                    parts[4],  # label
-                )
-            )
-    return entries
-
-
 class ChannelMapSettings(ez.Settings):
-    channel_map: str | None = None
-    """Path to the CMP file for this device. ``None`` (or an empty path)
-    means no CMP — the auto-grid fallback generates coordinates for every
-    channel."""
+    filepath: str | None = None
+    """Path to the ``.cmp`` file. ``None`` (or an empty path) means no CMP —
+    the auto-grid fallback generates coordinates for every channel."""
+
+    start_chan: int = 1
+    """1-based channel ID assigned to the first sorted CMP row.
+    Mirrors :meth:`pycbsdk.Session.load_channel_map`."""
+
+    hs_id: int = 0
+    """Headstage identifier; labels are prefixed ``"hs{hs_id}-"`` when nonzero.
+    Pass ``0`` (the default) to leave labels un-prefixed."""
 
 
 @processor_state
 class ChannelMapState:
     channel_axis: CoordinateAxis | None = None
+    cmp_mask: np.ndarray | None = None  # bool, length == channel_axis.data length
 
 
 class ChannelMapProcessor(BaseStatefulTransformer[ChannelMapSettings, AxisArray, AxisArray, ChannelMapState]):
     """Stateful transformer that attaches CMP-derived channel metadata.
 
-    State is re-built whenever the channel-axis length changes (detected
-    via :meth:`_hash_message`), so a mid-stream device swap that changes
-    ``n_ch`` triggers a fresh parse and auto-grid rebuild.
+    The base layer (incoming labels) is rebuilt only when no axis exists yet
+    or when ``n_ch`` changes. CMP entries accumulate into ``cmp_mask``;
+    auto-grid positions are recomputed each reset for the un-masked indices,
+    offset below the CMP geometry to avoid collisions.
+
+    Pushing ``filepath=None`` clears the cumulative overlay (see
+    :meth:`update_settings`).
     """
 
-    def _reset_state(self, message: AxisArray) -> None:
-        records: list[tuple[float, float, str, str, int]] = []
-        path = self.settings.channel_map
-        if path:
-            # A bad path or a malformed CMP must not take the pipeline
-            # down — the failure would otherwise loop on every incoming
-            # message (each triggers a fresh _reset_state via __acall__)
-            # and downstream would never see a message again. Log the
-            # problem and fall back to the auto-grid branch so the app
-            # keeps rendering with generic labels until the user picks a
-            # valid file.
-            try:
-                parsed = parse_cmp(path)
-            except Exception as exc:
-                logger.warning(
-                    "ChannelMapProcessor: could not load %r (%s); " "falling back to auto-grid labels.",
-                    path,
-                    exc,
-                )
-                parsed = []
-            # Sort by (bank, elec) so the CMP rows line up with the
-            # device's native channel ordering instead of whatever order
-            # the file happened to list them in.
-            parsed = sorted(parsed, key=lambda e: (e[2], e[3]))
-            for col, row, bank_letter, elec, label in parsed:
-                records.append((float(col), float(row), label, bank_letter, elec))
+    def update_settings(self, new_settings: ChannelMapSettings) -> None:
+        old_filepath = self.settings.filepath
+        super().update_settings(new_settings)
+        # filepath transitioning from set → unset is the explicit "clear" signal.
+        # Drop the cumulative overlay so the next reset rebuilds the base layer
+        # from incoming labels.
+        if old_filepath and not new_settings.filepath:
+            self.state.channel_axis = None
+            self.state.cmp_mask = None
 
-        n_mapped = len(records)
+    def _reset_state(self, message: AxisArray) -> None:
         ch_dim_idx = message.dims.index("ch")
         n_total = message.data.shape[ch_dim_idx]
 
-        if n_total > n_mapped:
-            # Auto-grid for channels the CMP doesn't cover. Tile them in a
-            # square-ish block below the last mapped row, using bank letters
-            # that start one past the CMP's highest.
-            n_remaining = n_total - n_mapped
-            grid_size = math.ceil(math.sqrt(n_remaining))
+        # n_ch changed since the last build → drop cumulative state.
+        if self.state.channel_axis is not None and len(self.state.channel_axis.data) != n_total:
+            self.state.channel_axis = None
+            self.state.cmp_mask = None
 
-            if records:
-                max_row = max(r[1] for r in records)
-                max_bank_ord = max(ord(r[3]) for r in records)
-            else:
-                max_row = -2.0
-                max_bank_ord = ord("A") - 1
+        # Base layer: labels from incoming, positions filled below by auto-grid.
+        if self.state.channel_axis is None:
+            ch_data = np.zeros(n_total, dtype=CHANNEL_DTYPE)
+            for i, label in enumerate(self._incoming_labels(message, n_total)):
+                ch_data[i]["label"] = label
+            self.state.channel_axis = CoordinateAxis(data=ch_data, dims=["ch"], unit="struct")
+            self.state.cmp_mask = np.zeros(n_total, dtype=bool)
 
-            start_row = max_row + 2
-            next_bank_ord = max_bank_ord + 1
+        # CMP overlay: write entries at chan_id-1 and mark them in cmp_mask.
+        path = self.settings.filepath
+        if path:
+            try:
+                parsed = parse_cmp(
+                    path,
+                    start_chan=self.settings.start_chan,
+                    hs_id=self.settings.hs_id,
+                )
+            except Exception as exc:
+                # _reset_state runs on every message via __acall__ until the
+                # hash matches; a re-raise would loop forever. Log and skip.
+                logger.warning(
+                    "ChannelMapProcessor: could not load %r (%s); keeping current channel axis.",
+                    path,
+                    exc,
+                )
+                parsed = {}
+            ch_data = self.state.channel_axis.data
+            for chan_id, entry in parsed.items():
+                idx = chan_id - 1
+                if not (0 <= idx < n_total):
+                    continue
+                col, row, bank_idx, elec = entry.position
+                ch_data[idx]["x"] = float(col)
+                ch_data[idx]["y"] = float(row)
+                ch_data[idx]["label"] = entry.label
+                ch_data[idx]["bank"] = chr(ord("A") + bank_idx - 1)
+                ch_data[idx]["elec"] = elec
+                self.state.cmp_mask[idx] = True
 
-            for i in range(n_remaining):
-                label = f"auto{n_mapped + i + 1}"
-                bank = chr(next_bank_ord + i // 32)
-                elec = (i % 32) + 1
-                col = float(i % grid_size)
-                row = start_row + i // grid_size
-                records.append((col, row, label, bank, elec))
+        # Auto-grid: position/bank/elec for indices the CMP didn't claim,
+        # offset below the CMP's geometry so they don't overlap.
+        self._fill_auto_grid()
 
-        ch_data = np.array(records, dtype=CHANNEL_DTYPE)
-        self.state.channel_axis = CoordinateAxis(data=ch_data[:n_total], dims=["ch"], unit="struct")
+    def _fill_auto_grid(self) -> None:
+        ch_data = self.state.channel_axis.data
+        cmp_mask = self.state.cmp_mask
+        auto_idx = np.flatnonzero(~cmp_mask)
+        if auto_idx.size == 0:
+            return
+
+        if cmp_mask.any():
+            max_row = float(ch_data["y"][cmp_mask].max())
+            max_bank_ord = max(
+                (ord(str(b)) for b in ch_data["bank"][cmp_mask] if str(b)),
+                default=ord("A") - 1,
+            )
+        else:
+            # No CMP yet — start auto-grid at the origin with bank A.
+            # max_row = -2 makes start_row = 0 below.
+            max_row = -2.0
+            max_bank_ord = ord("A") - 1
+
+        start_row = max_row + 2
+        next_bank_ord = max_bank_ord + 1
+        grid_size = max(1, math.ceil(math.sqrt(auto_idx.size)))
+
+        for i, idx in enumerate(auto_idx):
+            ch_data[idx]["x"] = float(i % grid_size)
+            ch_data[idx]["y"] = float(start_row + i // grid_size)
+            ch_data[idx]["bank"] = chr(next_bank_ord + i // 32)
+            ch_data[idx]["elec"] = (i % 32) + 1
+
+    @staticmethod
+    def _incoming_labels(message: AxisArray, n_total: int) -> list[str]:
+        ch_axis = message.axes.get("ch")
+        data = getattr(ch_axis, "data", None)
+        if data is None:
+            return [f"ch{i + 1}" for i in range(n_total)]
+        if data.dtype.names is not None and "label" in data.dtype.names:
+            labels = [str(x) for x in data["label"][:n_total]]
+        else:
+            labels = [str(x) for x in data[:n_total]]
+        if len(labels) < n_total:
+            labels.extend(f"ch{i + 1}" for i in range(len(labels), n_total))
+        return labels
 
     def _hash_message(self, message: AxisArray) -> int:
         ch_dim_idx = message.dims.index("ch")

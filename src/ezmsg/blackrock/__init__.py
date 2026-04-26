@@ -12,7 +12,6 @@ from .channel_map import (
     ChannelMapProcessor,
     ChannelMapSettings,
     ChannelMapUnit,
-    parse_cmp,
 )
 
 __all__ = [
@@ -28,5 +27,4 @@ __all__ = [
     "ChannelMapSettings",
     "ChannelMapUnit",
     "DeviceType",
-    "parse_cmp",
 ]

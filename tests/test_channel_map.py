@@ -1,6 +1,5 @@
 """Tests for ezmsg.blackrock.channel_map."""
 
-import math
 import pathlib
 
 import numpy as np
@@ -11,83 +10,30 @@ from ezmsg.blackrock.channel_map import (
     CHANNEL_DTYPE,
     ChannelMapProcessor,
     ChannelMapSettings,
-    parse_cmp,
 )
 
 CMP_FILE = str(pathlib.Path(__file__).resolve().parent / "128ChannelDefaultMapping.cmp")
 
 
-def _make_processor(channel_map: str | None = None) -> ChannelMapProcessor:
-    return ChannelMapProcessor(settings=ChannelMapSettings(channel_map=channel_map))
+def _make_processor(
+    filepath: str | None = None,
+    start_chan: int = 1,
+    hs_id: int = 0,
+) -> ChannelMapProcessor:
+    return ChannelMapProcessor(settings=ChannelMapSettings(filepath=filepath, start_chan=start_chan, hs_id=hs_id))
 
 
-def _make_message(n_channels: int, n_time: int = 5) -> AxisArray:
+def _make_message(n_channels: int, n_time: int = 5, ch_data: np.ndarray | None = None) -> AxisArray:
+    if ch_data is None:
+        ch_data = np.arange(n_channels)
     return AxisArray(
         data=np.zeros((n_time, n_channels)),
         dims=["time", "ch"],
         axes={
             "time": LinearAxis(offset=0.0, gain=0.001),
-            "ch": CoordinateAxis(data=np.arange(n_channels), dims=["ch"]),
+            "ch": CoordinateAxis(data=ch_data, dims=["ch"]),
         },
     )
-
-
-# ---------------------------------------------------------------------------
-# parse_cmp
-# ---------------------------------------------------------------------------
-
-
-class TestParseCmp:
-    def test_parse_128_channel_file(self):
-        entries = parse_cmp(CMP_FILE)
-        assert len(entries) == 128
-
-    def test_first_entry(self):
-        entries = parse_cmp(CMP_FILE)
-        col, row, bank, elec, label = entries[0]
-        assert col == 0
-        assert row == 7
-        assert bank == "A"
-        assert elec == 1
-        assert label == "chan1"
-
-    def test_last_entry(self):
-        entries = parse_cmp(CMP_FILE)
-        col, row, bank, elec, label = entries[-1]
-        assert col == 15
-        assert row == 0
-        assert bank == "D"
-        assert elec == 32
-        assert label == "chan128"
-
-    def test_bank_boundaries(self):
-        entries = parse_cmp(CMP_FILE)
-        # Entry 32 → start of bank B
-        _, _, bank, elec, label = entries[32]
-        assert bank == "B"
-        assert elec == 1
-        assert label == "chan33"
-        # Entry 64 → start of bank C
-        _, _, bank, elec, label = entries[64]
-        assert bank == "C"
-        assert elec == 1
-        assert label == "chan65"
-        # Entry 96 → start of bank D
-        _, _, bank, elec, label = entries[96]
-        assert bank == "D"
-        assert elec == 1
-        assert label == "chan97"
-
-    def test_all_banks_present(self):
-        entries = parse_cmp(CMP_FILE)
-        banks = {e[2] for e in entries}
-        assert banks == {"A", "B", "C", "D"}
-
-    def test_electrode_range(self):
-        entries = parse_cmp(CMP_FILE)
-        electrodes = [e[3] for e in entries]
-        assert min(electrodes) == 1
-        assert max(electrodes) == 32
 
 
 # ---------------------------------------------------------------------------
@@ -163,109 +109,205 @@ class TestChannelMapProcessor:
 
 
 # ---------------------------------------------------------------------------
-# Auto-grid for unmapped channels
+# Base auto-grid layer (no CMP)
 # ---------------------------------------------------------------------------
 
 
-class TestAutoGrid:
-    def test_extra_channels_appended(self):
-        """256 data channels with 128-ch CMP → 256 coordinate rows."""
-        proc = _make_processor(CMP_FILE)
-        out = proc(_make_message(256))
-        assert len(out.axes["ch"].data) == 256
-
-    def test_mapped_channels_unchanged(self):
-        """First 128 channels should be identical to the CMP-only case."""
-        exact = _make_processor(CMP_FILE)(_make_message(128)).axes["ch"].data
-        extra = _make_processor(CMP_FILE)(_make_message(256)).axes["ch"].data
-        assert np.array_equal(extra[:128], exact)
-
-    def test_grid_size(self):
-        """Auto-grid side length is ceil(sqrt(n_remaining))."""
-        proc = _make_processor(CMP_FILE)
-        out = proc(_make_message(256))
+class TestBaseLayer:
+    def test_no_cmp_uses_incoming_labels(self):
+        """With no CMP, labels are pulled from the incoming ch axis."""
+        labels = np.array([f"in{i}" for i in range(64)])
+        proc = _make_processor(None)
+        out = proc(_make_message(64, ch_data=labels))
         data = out.axes["ch"].data
-        grid_size = math.ceil(math.sqrt(128))  # 12
-        assert data[128:]["x"].max() < grid_size
+        assert data[0]["label"] == "in0"
+        assert data[63]["label"] == "in63"
 
-    def test_row_offset(self):
-        """First auto-grid row is max_row + 2."""
-        proc = _make_processor(CMP_FILE)
-        out = proc(_make_message(256))
-        data = out.axes["ch"].data
-        # Max row in CMP is 7, so first auto row should be 9.
-        assert data[128]["y"] == pytest.approx(9.0)
-
-    def test_first_extra_channel(self):
-        """Channel 129 (idx 128): label auto129, bank E, elec 1, col 0, row 9."""
-        proc = _make_processor(CMP_FILE)
-        out = proc(_make_message(256))
-        rec = out.axes["ch"].data[128]
-        assert rec["label"] == "auto129"
-        assert rec["bank"] == "E"
-        assert rec["elec"] == 1
-        assert rec["x"] == pytest.approx(0.0)
-        assert rec["y"] == pytest.approx(9.0)
-
-    def test_bank_increments_every_32(self):
-        proc = _make_processor(CMP_FILE)
-        out = proc(_make_message(256))
-        data = out.axes["ch"].data
-        assert np.all(data[128:160]["bank"] == "E")
-        assert np.all(data[160:192]["bank"] == "F")
-        assert np.all(data[192:224]["bank"] == "G")
-        assert np.all(data[224:256]["bank"] == "H")
-
-    def test_grid_wraps_columns(self):
-        proc = _make_processor(CMP_FILE)
-        out = proc(_make_message(256))
-        data = out.axes["ch"].data
-        # 13th extra channel (idx 12) should wrap to col 0, row 10.
-        assert data[128 + 12]["x"] == pytest.approx(0.0)
-        assert data[128 + 12]["y"] == pytest.approx(10.0)
-
-    def test_auto_labels_sequential(self):
-        proc = _make_processor(CMP_FILE)
-        out = proc(_make_message(131))
-        data = out.axes["ch"].data
-        assert data[128]["label"] == "auto129"
-        assert data[129]["label"] == "auto130"
-        assert data[130]["label"] == "auto131"
-
-    def test_auto_electrode_resets_per_bank(self):
-        proc = _make_processor(CMP_FILE)
-        out = proc(_make_message(256))
-        data = out.axes["ch"].data
-        for start in range(128, 256, 32):
-            np.testing.assert_array_equal(data[start : start + 32]["elec"], np.arange(1, 33))
-
-    def test_no_cmp_file_all_auto(self):
-        """With no CMP file, all channels are auto-generated."""
+    def test_no_cmp_grid_starts_at_origin(self):
+        """Base auto-grid lays channels out from (0, 0) regardless of CMP."""
         proc = _make_processor(None)
         out = proc(_make_message(64))
         data = out.axes["ch"].data
-        assert len(data) == 64
-        assert data[0]["label"] == "auto1"
-        assert data[0]["bank"] == "A"
-        assert data[0]["elec"] == 1
         assert data[0]["x"] == pytest.approx(0.0)
         assert data[0]["y"] == pytest.approx(0.0)
+        assert data[0]["bank"] == "A"
+        assert data[0]["elec"] == 1
 
-    def test_exact_match_no_auto(self):
-        """When channel count equals mapped count, no auto-grid is generated."""
+    def test_no_cmp_falls_back_to_chN_labels_when_axis_missing(self):
+        """If incoming has no ch axis, labels use ``ch{i+1}``."""
+        msg = AxisArray(
+            data=np.zeros((5, 4)),
+            dims=["time", "ch"],
+            axes={"time": LinearAxis(offset=0.0, gain=0.001)},
+        )
+        out = _make_processor(None)(msg)
+        labels = out.axes["ch"].data["label"]
+        assert list(labels) == ["ch1", "ch2", "ch3", "ch4"]
+
+    def test_bank_increments_every_32(self):
+        proc = _make_processor(None)
+        out = proc(_make_message(256))
+        data = out.axes["ch"].data
+        for k, letter in enumerate("ABCDEFGH"):
+            assert np.all(data[k * 32 : (k + 1) * 32]["bank"] == letter)
+
+    def test_electrode_resets_per_bank(self):
+        proc = _make_processor(None)
+        out = proc(_make_message(256))
+        data = out.axes["ch"].data
+        for start in range(0, 256, 32):
+            np.testing.assert_array_equal(data[start : start + 32]["elec"], np.arange(1, 33))
+
+
+# ---------------------------------------------------------------------------
+# CMP overlay
+# ---------------------------------------------------------------------------
+
+
+class TestCmpOverlay:
+    def test_overlay_lands_at_chan_id_minus_one_with_default_start_chan(self):
+        """start_chan=1 (default) → CMP entries land at indices 0..127."""
         proc = _make_processor(CMP_FILE)
+        out = proc(_make_message(256))
+        data = out.axes["ch"].data
+        assert data[0]["label"] == "chan1"
+        assert data[127]["label"] == "chan128"
+
+    def test_overlay_with_start_chan_offset(self):
+        """start_chan=129 → CMP describes the upper half; lower half stays base."""
+        proc = _make_processor(CMP_FILE, start_chan=129)
+        labels = np.array([f"in{i}" for i in range(256)])
+        out = proc(_make_message(256, ch_data=labels))
+        data = out.axes["ch"].data
+        # Lower half: untouched base layer (labels from incoming axis).
+        assert data[0]["label"] == "in0"
+        assert data[127]["label"] == "in127"
+        # Upper half: CMP entries landed here.
+        assert data[128]["label"] == "chan1"
+        assert data[255]["label"] == "chan128"
+
+    def test_overlay_preserves_n_total(self):
+        """Output axis still has one row per input channel."""
+        out = _make_processor(CMP_FILE)(_make_message(256))
+        assert len(out.axes["ch"].data) == 256
+
+    def test_overlay_out_of_range_chan_id_skipped(self):
+        """CMP entries whose chan_id-1 ≥ n_total are ignored, not appended."""
+        proc = _make_processor(CMP_FILE, start_chan=200)  # would write 200..327
+        out = proc(_make_message(256))
+        data = out.axes["ch"].data
+        assert len(data) == 256
+        # Indices 199..255 carry the CMP's first 57 entries; rest skipped.
+        assert data[199]["label"] == "chan1"
+        assert data[255]["label"] == "chan57"
+
+    def test_hs_id_prefixes_labels(self):
+        """hs_id != 0 prefixes labels with 'hs{hs_id}-'."""
+        proc = _make_processor(CMP_FILE, hs_id=2)
         out = proc(_make_message(128))
-        data = out.axes["ch"].data
-        assert not any(str(label).startswith("auto") for label in data["label"])
+        labels = out.axes["ch"].data["label"]
+        assert labels[0] == "hs2-chan1"
+        assert labels[127] == "hs2-chan128"
 
-    def test_one_extra_channel(self):
-        """Single extra channel gets a 1x1 grid."""
+    def test_missing_cmp_keeps_base_layer(self):
+        """A bad CMP path warns and leaves the existing axis intact."""
+        proc = _make_processor("/nonexistent/path.cmp")
+        out = proc(_make_message(8))
+        labels = out.axes["ch"].data["label"]
+        # Base layer survived: labels from incoming (np.arange) → "0".."7".
+        assert list(labels) == [str(i) for i in range(8)]
+
+
+# ---------------------------------------------------------------------------
+# Cross-reset state preservation
+# ---------------------------------------------------------------------------
+
+
+class TestStatePreservation:
+    def test_axis_preserved_across_reset_with_same_n_ch(self):
+        """Reset triggered by a setting change keeps the same axis object."""
         proc = _make_processor(CMP_FILE)
-        out = proc(_make_message(129))
+        proc(_make_message(256))
+        base_axis = proc.state.channel_axis
+        # Push a CMP-related setting change (start_chan) — arms a reset, but
+        # n_ch is unchanged so the axis object should be reused in place.
+        proc.update_settings(ChannelMapSettings(filepath=CMP_FILE, start_chan=129))
+        proc(_make_message(256))
+        assert proc.state.channel_axis is base_axis
+
+    def test_n_ch_change_rebuilds_base(self):
+        """A different n_ch forces base-layer rebuild on next message."""
+        labels_a = np.array([f"a{i}" for i in range(4)])
+        labels_b = np.array([f"b{i}" for i in range(8)])
+        proc = _make_processor(None)
+        proc(_make_message(4, ch_data=labels_a))
+        proc(_make_message(8, ch_data=labels_b))
+        labels_out = proc.state.channel_axis.data["label"]
+        assert list(labels_out) == ["b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7"]
+
+    def test_successive_cmps_accumulate(self):
+        """Pushing a second CMP at a disjoint start_chan adds to the existing overlay."""
+        proc = _make_processor(CMP_FILE)  # writes 0..127
+        proc(_make_message(256))
+        # Second push: same CMP, but offset to indices 128..255.
+        proc.update_settings(ChannelMapSettings(filepath=CMP_FILE, start_chan=129))
+        out = proc(_make_message(256))
         data = out.axes["ch"].data
-        assert len(data) == 129
-        rec = data[128]
-        assert rec["label"] == "auto129"
-        assert rec["bank"] == "E"
-        assert rec["x"] == pytest.approx(0.0)
-        assert rec["y"] == pytest.approx(9.0)
+        # Both halves now carry CMP labels.
+        assert data[0]["label"] == "chan1"
+        assert data[127]["label"] == "chan128"
+        assert data[128]["label"] == "chan1"
+        assert data[255]["label"] == "chan128"
+
+    def test_filepath_cleared_rebuilds_base(self):
+        """Pushing filepath=None drops the cumulative overlay and rebuilds the base."""
+        proc = _make_processor(CMP_FILE)
+        labels = np.array([f"in{i}" for i in range(256)])
+        proc(_make_message(256, ch_data=labels))
+        # Sanity: CMP overlay populated indices 0..127.
+        assert proc.state.cmp_mask[:128].all()
+        # Clear signal.
+        proc.update_settings(ChannelMapSettings(filepath=None))
+        out = proc(_make_message(256, ch_data=labels))
+        data = out.axes["ch"].data
+        # Overlay gone — every label comes from the incoming axis again.
+        assert list(data["label"][:5]) == ["in0", "in1", "in2", "in3", "in4"]
+        assert not proc.state.cmp_mask.any()
+
+
+# ---------------------------------------------------------------------------
+# Auto-grid placement avoids CMP positions
+# ---------------------------------------------------------------------------
+
+
+class TestAutoGridPlacement:
+    def test_auto_grid_y_offset_below_cmp(self):
+        """Auto-grid rows start below the CMP's max y (gap of +2)."""
+        proc = _make_processor(CMP_FILE)
+        out = proc(_make_message(256))
+        data = out.axes["ch"].data
+        cmp_y_max = float(data["y"][:128].max())
+        auto_y_min = float(data["y"][128:].min())
+        assert auto_y_min >= cmp_y_max + 2
+
+    def test_auto_grid_bank_starts_past_cmp(self):
+        """Auto-grid banks start one letter past the CMP's highest bank."""
+        proc = _make_processor(CMP_FILE)  # CMP uses banks A-D
+        out = proc(_make_message(256))
+        data = out.axes["ch"].data
+        cmp_banks = set(data["bank"][:128].tolist())
+        auto_banks = set(data["bank"][128:].tolist())
+        assert max(cmp_banks) == "D"
+        assert min(auto_banks) == "E"
+
+    def test_auto_grid_skips_cmp_indices_with_offset_start_chan(self):
+        """With start_chan=129 the CMP fills 128..255; auto-grid lays out 0..127 below."""
+        proc = _make_processor(CMP_FILE, start_chan=129)
+        out = proc(_make_message(256))
+        data = out.axes["ch"].data
+        # CMP positions on the upper half.
+        assert data[128]["bank"] == "A"  # CMP's first sorted bank
+        # Auto-grid (lower half) is offset below CMP's max y (=7) → y >= 9.
+        assert data[0]["y"] >= 9.0
+        # And uses banks past CMP's max (D) → starts at E.
+        assert data[0]["bank"] == "E"

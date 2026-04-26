@@ -160,7 +160,7 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
                 )
 
             if self.settings.cmp_path:
-                self._session.load_channel_map(self.settings.cmp_path, 0)
+                self._session.load_channel_map(self.settings.cmp_path)
 
             self._session.sync()
 
@@ -227,7 +227,7 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
         if cmp_path is None:
             logger.warning("CereLinkProducer.reload_channel_map: pycbsdk has no clear API; keeping previous map.")
             return
-        self._session.load_channel_map(cmp_path, 0)
+        self._session.load_channel_map(cmp_path)
         all_ids = self._session.get_matching_channel_ids(ChannelType.FRONTEND)
         all_pos = self._session.get_channels_positions(ChannelType.FRONTEND)
         self._ch_positions = dict(zip(all_ids, all_pos))

@@ -153,6 +153,7 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
                     self.settings.sample_rate,
                     disable_others=True,
                 )
+                self._session.sync()
                 self._session.set_ac_input_coupling(
                     n_chans,
                     self.settings.channel_type,

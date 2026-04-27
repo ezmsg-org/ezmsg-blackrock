@@ -10,11 +10,14 @@ from dataclasses import dataclass
 
 import ezmsg.core as ez
 import numpy as np
-from ezmsg.baseproc.processor import BaseProducer
+from ezmsg.baseproc import processor_state
+from ezmsg.baseproc.stateful import BaseStatefulProducer
 from ezmsg.baseproc.units import BaseProducerUnit, get_base_producer_type
 from ezmsg.event.message import EventMessage
 from ezmsg.util.messages.axisarray import AxisArray, replace
 from pycbsdk import ChannelType, DeviceType, SampleRate, Session
+
+from .channel_map import CHANNEL_DTYPE, ChannelMapSettings
 
 logger = logging.getLogger(__name__)
 
@@ -39,24 +42,66 @@ class DeviceStatus:
     error: str = ""
 
 
-CHANNEL_DTYPE = np.dtype(
-    [
-        ("x", "f4"),
-        ("y", "f4"),
-        ("label", "U16"),
-        ("bank", "U1"),
-        ("elec", "i4"),
-    ]
-)
-
-
 class CereLinkSettings(ez.Settings):
+    # --- Connection ---
+
     device_type: DeviceType | None = None
     """Device type to connect to. ``None`` = no Session — the unit produces
     nothing until a real device is selected. This idle-by-default mode lets
     a host app defer the cost of opening pycbsdk until the user picks a
     device, which is useful on macOS where simultaneous Sessions exhaust
     POSIX shared memory."""
+
+    # --- Device configuration: ccf_path XOR programmatic (config_chans + config_rate) ---
+
+    ccf_path: str | None = None
+    """CCF file to load after connection (or None to skip).
+    Mutually exclusive with ``config_chans`` (both touch the device's
+    sample-group configuration)."""
+
+    config_chans: int | None = None
+    """Programmatic-setup signal:
+
+    * ``None`` (default): leave the device's existing sample-group config
+      untouched. Use this when ``ccf_path`` is set, or when relying on
+      whatever the device already has loaded.
+    * Any integer: call ``set_sample_group`` with this count (clamped to the
+      number of channels actually matching ``config_chan_type``, so passing
+      ``int(1e6)`` is a valid "give me all available" shorthand). Requires
+      ``config_rate`` to be set; mutually exclusive with ``ccf_path``."""
+
+    config_chan_type: ChannelType = ChannelType.FRONTEND
+    """Channel type used for programmatic setup, AC coupling, and the
+    auto-resolution of ``config_chans``."""
+
+    config_rate: SampleRate | None = None
+    """Sample rate for the programmatically-configured group. Co-required
+    with ``config_chans`` — set both or neither. Has no effect on its own
+    (use ``subscribe_rate`` to filter capture without configuring)."""
+
+    ac_input_coupling: bool = False
+    """AC input coupling (highpass filter). Applied whenever ``ccf_path`` is
+    None, using ``(config_chans, config_chan_type)`` — both default to "all
+    matching channels of ``config_chan_type``" if not specified. Ignored in
+    CCF mode (CCF owns coupling)."""
+
+    # --- Capture filter ---
+
+    subscribe_rate: SampleRate | None = None
+    """Restricts ``on_group_batch`` registration to this rate. ``None``
+    registers for every active group the device reports (the right default
+    with a CCF that activates multiple rates). Independent of
+    ``config_rate``: a CCF that wires up multiple rates can be filtered
+    down to one by setting ``subscribe_rate`` alone."""
+
+    # --- Channel-map overlay ---
+
+    cmp_configs: tuple[ChannelMapSettings, ...] = ()
+    """One :class:`ChannelMapSettings` per headstage to apply after connection.
+    Each is forwarded to ``session.load_channel_map(filepath, start_chan, hs_id)``.
+    Empty tuple skips CMP loading entirely."""
+
+    # --- Data interpretation (no device interaction) ---
 
     cbtime: bool = False
     """True = raw device nanoseconds/1e9, False = time.monotonic() via clock sync."""
@@ -67,45 +112,37 @@ class CereLinkSettings(ez.Settings):
     cont_buffer_dur: float = 0.5
     """Ring buffer duration in seconds per sample rate group."""
 
-    ccf_path: str | None = None
-    """CCF file to load after connection (or None to skip).
-    Mutually exclusive with n_chans/sample_rate."""
-
-    cmp_path: str | None = None
-    """CMP file for electrode positions (or None to skip). Bank offset is always 0."""
-
-    n_chans: int | None = None
-    """Number of channels to enable (used with channel_type and sample_rate).
-    Mutually exclusive with ccf_path."""
-
-    channel_type: ChannelType = ChannelType.FRONTEND
-    """Channel type filter for programmatic setup."""
-
-    sample_rate: SampleRate | None = None
-    """Sample rate for programmatic setup (e.g. SampleRate.SR_30kHz).
-    Mutually exclusive with ccf_path."""
-
-    ac_input_coupling: bool = False
-    """AC input coupling (highpass filter). Ignored when ccf_path is provided."""
-
     def __post_init__(self):
-        has_manual = self.n_chans is not None or self.sample_rate is not None
-        if self.ccf_path is not None and has_manual:
-            raise ValueError("ccf_path and n_chans/sample_rate are mutually exclusive")
-        if self.n_chans is not None and self.sample_rate is None:
-            raise ValueError("sample_rate is required when n_chans is set")
+        if self.ccf_path is not None and self.config_chans is not None:
+            raise ValueError("ccf_path and config_chans are mutually exclusive")
+        # Programmatic setup is all-or-nothing: config_chans and config_rate
+        # are meaningless apart, so reject the partial-config footgun.
+        if (self.config_chans is None) != (self.config_rate is None):
+            raise ValueError("config_chans and config_rate must be set together (or neither)")
 
 
-class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
+@processor_state
+class CereLinkProducerState:
+    """Empty placeholder so :class:`CereLinkProducer` can be a stateful producer.
+
+    The session/buffers/positions live as instance attributes today; moving
+    them into this dataclass and routing the open/close lifecycle through
+    ``_reset_state`` is the planned follow-up. Until then, this exists only
+    so the stateful base-class machinery (``_request_reset``, the
+    ``update_settings`` reset gate, etc.) is wired up.
+    """
+
+
+class CereLinkProducer(BaseStatefulProducer[CereLinkSettings, AxisArray, CereLinkProducerState]):
     """Owns the pycbsdk Session, ring buffers, and spike queue."""
 
-    # Documentary only: this is a non-stateful producer, and CereLinkSource
-    # overrides on_settings entirely (the lifecycle is async + multi-Session
-    # and doesn't fit BaseProducer.update_settings). The list still records
-    # which fields can change without any open()/close() reaction.
-    # cont_buffer_dur is intentionally NOT live-safe — it's consumed only in
-    # _setup_group during open() and changing it requires a session restart.
-    NONRESET_SETTINGS_FIELDS = frozenset({"cbtime", "microvolts"})
+    # Fields whose change can be absorbed without closing and re-opening the
+    # pycbsdk Session. CereLinkSource.on_settings drives the in-place vs
+    # session-restart decision today (it doesn't yet route through
+    # update_settings); this list documents the contract.
+    NONRESET_SETTINGS_FIELDS = frozenset(
+        {"cbtime", "microvolts", "cont_buffer_dur", "cmp_configs", "ac_input_coupling"}
+    )
 
     def __init__(self, *args, settings: CereLinkSettings | None = None, **kwargs):
         super().__init__(*args, settings=settings, **kwargs)
@@ -116,6 +153,16 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
         self._active_rates: list[int] = []
         self._round_robin_idx: int = 0
         self._loop: asyncio.AbstractEventLoop | None = None
+
+    def _reset_state(self) -> None:
+        """No-op: the open/close lifecycle is driven by :class:`CereLinkSource`.
+
+        BaseStatefulProducer calls this once on the first ``__acall__`` and
+        again on every ``_request_reset()``. Migrating the session lifecycle
+        in here (so settings updates re-run open/close automatically) is the
+        planned follow-up; doing it now would conflict with the existing
+        async multi-Session dance in ``CereLinkSource.on_settings``.
+        """
 
     # -- Lifecycle --
 
@@ -135,58 +182,113 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
         # in STANDALONE mode). Any exception below must release them, or we
         # orphan the fds for the life of the process.
         try:
-            deadline = time.monotonic() + 10.0
-            while not self._session.running:
-                if time.monotonic() > deadline:
-                    raise TimeoutError("Session did not start within 10 seconds")
-                time.sleep(0.1)
-
-            if self.settings.ccf_path:
-                self._session.load_ccf_sync(self.settings.ccf_path)
-            elif self.settings.sample_rate is not None:
-                n_chans = self.settings.n_chans
-                if n_chans is None:
-                    n_chans = len(self._session.get_matching_channel_ids(self.settings.channel_type))
-                self._session.set_channel_sample_group(
-                    n_chans,
-                    self.settings.channel_type,
-                    self.settings.sample_rate,
-                    disable_others=True,
-                )
-                self._session.sync()
-                self._session.set_ac_input_coupling(
-                    n_chans,
-                    self.settings.channel_type,
-                    self.settings.ac_input_coupling,
-                )
-
-            if self.settings.cmp_path:
-                self._session.load_channel_map(self.settings.cmp_path)
-
+            self._wait_until_running(timeout_s=10.0)
+            self._configure_device()
+            self._apply_channel_maps()
+            # CRITICAL: sync() must precede _apply_ac_coupling(). pycbsdk has no
+            # narrowly-scoped AC-coupling packet, so set_ac_input_coupling sends
+            # a general-config packet seeded from our local mirror of device
+            # state. Until the device's responses to set_sample_group / load_ccf
+            # / load_channel_map have come back through sync(), that mirror is
+            # stale and the AC packet would replay the stale config — silently
+            # reverting whatever set_sample_group / load_ccf just did. Same rule
+            # applies to any future call site that touches AC coupling after a
+            # config change: sync() in between, every time.
             self._session.sync()
-
-            # Pre-fetch channel positions (available after CCF/CMP loading)
-            all_ids = self._session.get_matching_channel_ids(ChannelType.FRONTEND)
-            all_pos = self._session.get_channels_positions(ChannelType.FRONTEND)
-            self._ch_positions: dict[int, tuple] = dict(zip(all_ids, all_pos))
-
-            # Discover active groups and set up ring buffers + callbacks
-            for rate in SampleRate:
-                if rate == SampleRate.NONE:
-                    continue
-                channels = self._session.get_group_channels(int(rate))
-                if not channels:
-                    continue
-                self._setup_group(rate, channels)
-
-            # Spike callback
-            @self._session.on_event(ChannelType.FRONTEND)
-            def _on_spike(header, data):
-                self._handle_spike(header)
+            self._apply_ac_coupling()
+            self._cache_channel_positions()
+            self._setup_capture_groups()
+            self._register_spike_callback()
         except BaseException:
             self._session.__exit__(None, None, None)
             self._session = None
             raise
+
+    def _wait_until_running(self, timeout_s: float) -> None:
+        deadline = time.monotonic() + timeout_s
+        while self._session is None or not self._session.running:
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"Session did not start within {timeout_s} seconds")
+            time.sleep(0.1)
+
+    def _resolve_n_chans(self) -> int:
+        """Number of channels to apply settings to — clamped to actually-available."""
+        s = self.settings
+        available = len(self._session.get_matching_channel_ids(s.config_chan_type))
+        if s.config_chans is None:
+            return available
+        return min(s.config_chans, available)
+
+    def _configure_device(self) -> None:
+        """Load CCF or programmatically configure the sample group."""
+        s = self.settings
+        if s.ccf_path:
+            self._session.load_ccf_sync(s.ccf_path)
+            return
+        if s.config_chans is not None:
+            # __post_init__ guarantees config_rate is set when config_chans is.
+            self._session.set_sample_group(
+                self._resolve_n_chans(),
+                s.config_chan_type,
+                s.config_rate,
+                disable_others=True,
+            )
+            self._session.sync()
+
+    def _apply_ac_coupling(self) -> None:
+        """Apply AC coupling — only meaningful when CCF isn't owning device config.
+
+        .. warning::
+           Callers MUST run ``self._session.sync()`` after any preceding
+           device-config call (``set_sample_group``, ``load_ccf_sync``,
+           ``load_channel_map``, etc.) and BEFORE calling this method.
+           ``set_ac_input_coupling`` rides on a general-config packet seeded
+           from our local mirror of device state; if device responses to the
+           prior config calls haven't been processed yet, the mirror is stale
+           and this call will replay the stale config — silently undoing the
+           preceding change.
+        """
+        s = self.settings
+        if s.ccf_path:
+            return
+        self._session.set_ac_input_coupling(
+            self._resolve_n_chans(),
+            s.config_chan_type,
+            s.ac_input_coupling,
+        )
+
+    def _apply_channel_maps(self) -> None:
+        for cfg in self.settings.cmp_configs:
+            if cfg.filepath:
+                self._session.load_channel_map(cfg.filepath, cfg.start_chan, cfg.hs_id)
+
+    def _cache_channel_positions(self) -> None:
+        """Pre-fetch channel positions (available after CCF/CMP loading)."""
+        all_ids = self._session.get_matching_channel_ids(ChannelType.FRONTEND)
+        all_pos = self._session.get_channels_positions(ChannelType.FRONTEND)
+        self._ch_positions = dict(zip(all_ids, all_pos))
+
+    def _setup_capture_groups(self) -> None:
+        """Register ring buffers + on_group_batch callbacks for the configured rate(s).
+
+        ``subscribe_rate=None`` registers every active group the device reports
+        (correct default in CCF mode where multiple rates may be active).
+        Setting ``subscribe_rate`` restricts capture to that single group.
+        """
+        if self.settings.subscribe_rate is not None:
+            rates = [self.settings.subscribe_rate]
+        else:
+            rates = [r for r in SampleRate if r != SampleRate.NONE]
+        for rate in rates:
+            channels = self._session.get_group_channels(int(rate))
+            if not channels:
+                continue
+            self._setup_group(rate, channels)
+
+    def _register_spike_callback(self) -> None:
+        @self._session.on_event(ChannelType.FRONTEND)
+        def _on_spike(header, data):
+            self._handle_spike(header)
 
     def close(self) -> None:
         """Tear down the Session and unblock any in-flight ``_produce``.
@@ -217,18 +319,19 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
             ch_info[i]["elec"] = pos[3]
         return ch_info
 
-    def reload_channel_map(self, cmp_path: str) -> None:
-        """Apply a new CMP to the existing Session, refresh cached positions,
-        and rebuild each active group's template so subsequent AxisArrays
-        carry the new (x, y) positions.
+    def reload_channel_maps(self, cmp_configs: tuple[ChannelMapSettings, ...]) -> None:
+        """Apply each CMP in *cmp_configs* to the live Session, refresh cached
+        positions, and rebuild each active group's template so subsequent
+        AxisArrays carry the new (x, y) positions.
 
-        pycbsdk has no API to *clear* an applied CMP — pass ``None`` and
-        the call is a no-op with a warning.
+        pycbsdk has no API to *clear* applied CMPs — successive calls merge
+        into the device's overlay. An empty ``cmp_configs`` is a no-op.
         """
-        if cmp_path is None:
-            logger.warning("CereLinkProducer.reload_channel_map: pycbsdk has no clear API; keeping previous map.")
+        if not cmp_configs:
             return
-        self._session.load_channel_map(cmp_path)
+        for cfg in cmp_configs:
+            if cfg.filepath:
+                self._session.load_channel_map(cfg.filepath, cfg.start_chan, cfg.hs_id)
         all_ids = self._session.get_matching_channel_ids(ChannelType.FRONTEND)
         all_pos = self._session.get_channels_positions(ChannelType.FRONTEND)
         self._ch_positions = dict(zip(all_ids, all_pos))
@@ -238,13 +341,6 @@ class CereLinkProducer(BaseProducer[CereLinkSettings, AxisArray]):
             new_ch_ax = AxisArray.CoordinateAxis(data=ch_info, dims=["ch"], unit="struct")
             old = buf["template"]
             buf["template"] = replace(old, axes={**old.axes, "ch": new_ch_ax})
-
-    def reload_ccf(self, ccf_path: str) -> None:
-        """Apply a new CCF on the existing Session. ``None`` is a no-op."""
-        if ccf_path is None:
-            logger.warning("CereLinkProducer.reload_ccf: pycbsdk has no clear API; keeping previous CCF.")
-            return
-        self._session.load_ccf_sync(ccf_path)
 
     def _setup_group(self, rate: SampleRate, channels: list[int]) -> None:
         rate_int = int(rate)
@@ -425,10 +521,11 @@ class CereLinkSource(BaseProducerUnit[CereLinkSettings, AxisArray, CereLinkProdu
             logger.info("CereLinkSource._start_producer: idle (no device selected)")
             return
         logger.info(
-            "CereLinkSource._start_producer: opened device=%s n_chans=%s sample_rate=%s",
+            "CereLinkSource._start_producer: opened device=%s config_chans=%s config_rate=%s subscribe_rate=%s",
             s.device_type.name,
-            s.n_chans,
-            s.sample_rate.name if s.sample_rate is not None else None,
+            s.config_chans,
+            s.config_rate.name if s.config_rate is not None else None,
+            s.subscribe_rate.name if s.subscribe_rate is not None else None,
         )
 
     async def initialize(self) -> None:
@@ -450,26 +547,32 @@ class CereLinkSource(BaseProducerUnit[CereLinkSettings, AxisArray, CereLinkProdu
     @ez.subscriber(BaseProducerUnit.INPUT_SETTINGS)
     async def on_settings(self, msg: CereLinkSettings) -> None:
         logger.info(
-            "CereLinkSource.on_settings: switching to device=%s n_chans=%s sample_rate=%s ccf=%s cmp=%s",
+            "CereLinkSource.on_settings: switching to device=%s config_chans=%s "
+            "config_rate=%s subscribe_rate=%s ccf=%s cmp_configs=%d",
             _device_label(msg.device_type),
-            msg.n_chans,
-            msg.sample_rate.name if msg.sample_rate is not None else None,
+            msg.config_chans,
+            msg.config_rate.name if msg.config_rate is not None else None,
+            msg.subscribe_rate.name if msg.subscribe_rate is not None else None,
             msg.ccf_path,
-            msg.cmp_path,
+            len(msg.cmp_configs),
         )
         prev = self.SETTINGS
 
-        # Recreating a pycbsdk Session against the same physical device (and
-        # NPLAY in particular — single-client emulator) corrupts the new
-        # session via the old session's ``__exit__``. So if only CMP/CCF
-        # changed and we already have a working session, apply the change
-        # in-place rather than spawning a fresh producer.
+        # Mirrors CereLinkProducer.NONRESET_SETTINGS_FIELDS: anything outside
+        # that list requires closing and re-opening the pycbsdk Session.
+        # Recreating a Session against the same physical device (especially
+        # NPLAY, a single-client emulator) corrupts the new session via the
+        # old one's ``__exit__``, so the in-place path is preferred whenever
+        # the changed fields permit it.
+        # subscribe_rate is conservatively in the restart set — applying it
+        # in-place would need a re-register helper for on_group_batch.
         needs_session_restart = (
             msg.device_type != prev.device_type
-            or msg.n_chans != prev.n_chans
-            or msg.sample_rate != prev.sample_rate
-            or msg.channel_type != prev.channel_type
-            or msg.ac_input_coupling != prev.ac_input_coupling
+            or msg.config_chans != prev.config_chans
+            or msg.config_rate != prev.config_rate
+            or msg.config_chan_type != prev.config_chan_type
+            or msg.subscribe_rate != prev.subscribe_rate
+            or msg.ccf_path != prev.ccf_path
         )
         if not needs_session_restart and getattr(self.producer, "_session", None) is not None:
             asyncio.create_task(self._apply_in_place_settings(msg, prev))
@@ -487,18 +590,32 @@ class CereLinkSource(BaseProducerUnit[CereLinkSettings, AxisArray, CereLinkProdu
         asyncio.create_task(self._finalize_settings_change(msg, prev_producer, new_producer))
 
     async def _apply_in_place_settings(self, msg: CereLinkSettings, prev: CereLinkSettings) -> None:
-        """Apply CMP/CCF changes to the existing producer's Session."""
+        """Apply NONRESET-eligible settings changes to the live Session.
+
+        ``cont_buffer_dur`` changes are accepted but won't take effect until
+        the next session restart — resizing the in-flight ring buffers safely
+        is left to the planned ``_reset_state`` migration.
+        """
+        # Rebind producer.settings up front so the helpers below read the
+        # new values when they re-derive things like ``_resolve_n_chans``.
+        self.producer.settings = msg
         try:
-            if msg.ccf_path != prev.ccf_path:
-                await asyncio.to_thread(self.producer.reload_ccf, msg.ccf_path)
-            if msg.cmp_path != prev.cmp_path:
-                await asyncio.to_thread(self.producer.reload_channel_map, msg.cmp_path)
+            if msg.cmp_configs != prev.cmp_configs:
+                await asyncio.to_thread(self.producer.reload_channel_maps, msg.cmp_configs)
+            if msg.ac_input_coupling != prev.ac_input_coupling:
+                # Honor _apply_ac_coupling's contract: any preceding device
+                # config (the cmp_configs reload above, or anything that ran
+                # since the last sync) must be flushed first, or the general-
+                # config packet that carries the AC change will replay a stale
+                # local mirror and undo it.
+                await asyncio.to_thread(self.producer._session.sync)
+                await asyncio.to_thread(self.producer._apply_ac_coupling)
         except Exception as exc:
-            logger.exception("CereLinkSource: in-place CMP/CCF reload failed")
+            logger.exception("CereLinkSource: in-place settings apply failed")
+            # Roll producer.settings back to keep state consistent.
+            self.producer.settings = prev
             await self._status_queue.put(DeviceStatus(device_type=msg.device_type, success=False, error=str(exc)))
             return
-        # Update the producer's settings reference so subsequent reads match.
-        self.producer.settings = msg
         self.apply_settings(msg)
         await self._status_queue.put(DeviceStatus(device_type=msg.device_type, success=True))
 
@@ -562,10 +679,11 @@ class CereLinkSource(BaseProducerUnit[CereLinkSettings, AxisArray, CereLinkProdu
             logger.info("CereLinkSource: now idle (no device)")
         else:
             logger.info(
-                "CereLinkSource: opened device=%s n_chans=%s sample_rate=%s",
+                "CereLinkSource: opened device=%s config_chans=%s config_rate=%s subscribe_rate=%s",
                 s.device_type.name,
-                s.n_chans,
-                s.sample_rate.name if s.sample_rate is not None else None,
+                s.config_chans,
+                s.config_rate.name if s.config_rate is not None else None,
+                s.subscribe_rate.name if s.subscribe_rate is not None else None,
             )
         self.apply_settings(new_settings)
         await self._status_queue.put(DeviceStatus(device_type=new_settings.device_type, success=True))

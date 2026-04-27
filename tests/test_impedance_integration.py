@@ -41,9 +41,9 @@ def test_impedance_from_playback(nplayserver):
     producer = CereLinkProducer(
         settings=CereLinkSettings(
             device_type=DeviceType.NPLAY,
-            n_chans=128,
-            channel_type=ChannelType.FRONTEND,
-            sample_rate=SampleRate.SR_RAW,
+            config_chans=128,
+            config_chan_type=ChannelType.FRONTEND,
+            config_rate=SampleRate.SR_RAW,
             ac_input_coupling=False,
             microvolts=True,
             cbtime=False,

@@ -41,16 +41,16 @@ def nplayserver(nplayserver_binary, ns6_path):
 
 
 class TestCereLinkSource:
-    """CereLinkSource end-to-end tests (4-channel data, max n_chans=4)."""
+    """CereLinkSource end-to-end tests (4-channel data, max config_chans=4)."""
 
     def test_receive_data(self, nplayserver, tmp_path):
         n_ch = 2
         messages = _run_source(
             CereLinkSettings(
                 device_type=DeviceType.NPLAY,
-                n_chans=n_ch,
-                channel_type=ChannelType.FRONTEND,
-                sample_rate=SampleRate.SR_30kHz,
+                config_chans=n_ch,
+                config_chan_type=ChannelType.FRONTEND,
+                config_rate=SampleRate.SR_30kHz,
                 microvolts=False,
                 cbtime=True,
             ),
@@ -70,9 +70,9 @@ class TestCereLinkSource:
         messages = _run_source(
             CereLinkSettings(
                 device_type=DeviceType.NPLAY,
-                n_chans=n_ch,
-                channel_type=ChannelType.FRONTEND,
-                sample_rate=SampleRate.SR_30kHz,
+                config_chans=n_ch,
+                config_chan_type=ChannelType.FRONTEND,
+                config_rate=SampleRate.SR_30kHz,
                 microvolts=True,
                 cbtime=True,
             ),
@@ -88,9 +88,9 @@ class TestCereLinkSource:
         messages = _run_source(
             CereLinkSettings(
                 device_type=DeviceType.NPLAY,
-                n_chans=1,
-                channel_type=ChannelType.FRONTEND,
-                sample_rate=SampleRate.SR_30kHz,
+                config_chans=1,
+                config_chan_type=ChannelType.FRONTEND,
+                config_rate=SampleRate.SR_30kHz,
                 microvolts=False,
                 cbtime=False,
             ),
@@ -108,9 +108,9 @@ class TestCereLinkSource:
         messages = _run_source(
             CereLinkSettings(
                 device_type=DeviceType.NPLAY,
-                n_chans=n_ch,
-                channel_type=ChannelType.FRONTEND,
-                sample_rate=SampleRate.SR_30kHz,
+                config_chans=n_ch,
+                config_chan_type=ChannelType.FRONTEND,
+                config_rate=SampleRate.SR_30kHz,
                 microvolts=False,
                 cbtime=True,
             ),
@@ -126,9 +126,9 @@ class TestCereLinkSource:
         messages = _run_source(
             CereLinkSettings(
                 device_type=DeviceType.NPLAY,
-                n_chans=2,
-                channel_type=ChannelType.FRONTEND,
-                sample_rate=SampleRate.SR_30kHz,
+                config_chans=2,
+                config_chan_type=ChannelType.FRONTEND,
+                config_rate=SampleRate.SR_30kHz,
                 microvolts=False,
                 cbtime=False,
             ),

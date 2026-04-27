@@ -6,6 +6,7 @@ from conftest import run_nplayserver
 from pycbsdk import DeviceType
 
 from ezmsg.blackrock.cerelink import CereLinkProducer, CereLinkSettings
+from ezmsg.blackrock.channel_map import ChannelMapSettings
 
 pytestmark = pytest.mark.integration
 
@@ -26,7 +27,7 @@ class TestInitialization:
             settings=CereLinkSettings(
                 device_type=DeviceType.NPLAY,
                 ccf_path=str(ccf_256_path),
-                cmp_path=str(cmp_path),
+                cmp_configs=(ChannelMapSettings(filepath=str(cmp_path)),),
             )
         )
         producer.open()

@@ -814,3 +814,386 @@ class CereLinkSource(BaseProducerUnit[CereLinkSettings, AxisArray, CereLinkProdu
         while True:
             status = await self._status_queue.get()
             yield self.OUTPUT_DEVICE_STATUS, status
+
+
+# --- New producer/source classes (Phase 2 of the split refactor) -----------
+#
+# `_CereLinkBaseProducer` is the shared lifecycle/configure base for one-stream-
+# per-source producers. `CereLinkSignalProducer` / `CereLinkSignalSource` is
+# the continuous-data leaf. The spike leaf is added in Phase 3. The old
+# `CereLinkProducer` / `CereLinkSource` remain in place until Phase 4 cutover.
+
+
+_SettingsT = typing.TypeVar("_SettingsT")
+_StateT = typing.TypeVar("_StateT")
+
+
+@processor_state
+class _CereLinkSharedState:
+    """State fields common to signal and spike producers."""
+
+    session: Session | None = None
+    ch_positions: dict | None = None  # ch_id -> (col, row, bank, elec)
+
+
+@processor_state
+class CereLinkSignalProducerState(_CereLinkSharedState):
+    """Signal-producer ring buffer + emission template."""
+
+    buffer_data: np.ndarray | None = None  # int16 [N_t, n_ch]
+    buffer_timestamps: np.ndarray | None = None  # uint64 [N_t]
+    write_idx: int = 0
+    read_idx: int = 0
+    n_channels: int = 0
+    template: AxisArray | None = None
+    scale_factors: np.ndarray | None = None
+    data_event: asyncio.Event | None = None  # set by callback when new samples arrive
+
+
+class _CereLinkBaseProducer(
+    BaseStatefulProducer[_SettingsT, AxisArray, _StateT],
+    typing.Generic[_SettingsT, _StateT],
+):
+    """Shared lifecycle/configure base for one-stream-per-source producers.
+
+    Concrete subclasses override ``_apply_slice_configure``, ``_setup_subscription``,
+    and ``_produce``. The async open/close lifecycle is driven by ``_areset_state``
+    (run automatically by :class:`BaseStatefulProducer.__acall__` on first call
+    and after every :meth:`_request_reset`).
+    """
+
+    NONRESET_SETTINGS_FIELDS = frozenset({"cbtime", "microvolts", "cmp_configs"})
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._status_callback: typing.Callable[[DeviceStatus], None] | None = None
+
+    def set_status_callback(self, cb: typing.Callable[[DeviceStatus], None]) -> None:
+        """Inject the unit's status emitter — wired up by the Source on construct
+        so the producer can publish open/close results without holding a Source ref."""
+        self._status_callback = cb
+
+    def _emit_status(self, status: DeviceStatus) -> None:
+        if self._status_callback is not None:
+            self._status_callback(status)
+
+    def _reset_state(self) -> None:
+        """Sync reset hook — no-op. Open/configure is async (see ``_areset_state``)."""
+        pass
+
+    async def _areset_state(self) -> None:
+        """Close any prior session, open and configure a new one.
+
+        On exception leaves state without a session so ``_produce`` returns
+        None and the unit stays idle. Status is emitted on both success and
+        failure so the host app can reconcile.
+        """
+        await self._teardown_state()
+        if self.settings.device_type is None:
+            return  # idle
+        try:
+            await self._open_and_configure()
+        except Exception as exc:
+            logger.exception(
+                "CereLink: failed to open device=%s",
+                _device_label(self.settings.device_type),
+            )
+            await self._teardown_state()
+            self._emit_status(
+                DeviceStatus(
+                    device_type=self.settings.device_type,
+                    success=False,
+                    error=str(exc),
+                )
+            )
+            return
+        self._emit_status(DeviceStatus(device_type=self.settings.device_type, success=True))
+
+    async def _teardown_state(self) -> None:
+        """Release the Session and wake any waiters."""
+        self._on_teardown_pre_close()
+        if self.state.session is not None:
+            try:
+                await asyncio.to_thread(self.state.session.__exit__, None, None, None)
+            except Exception:
+                logger.exception("CereLink: error during async teardown")
+            self.state.session = None
+
+    def _on_teardown_pre_close(self) -> None:
+        """Subclass hook called before the Session is closed (e.g., to wake await-ers)."""
+        pass
+
+    async def _open_and_configure(self) -> None:
+        loop = asyncio.get_running_loop()
+        self.state.session = Session(device_type=self.settings.device_type)
+        try:
+            await asyncio.to_thread(self.state.session.__enter__)
+            await self.state.session.wait_until_running(timeout=10.0)
+            await asyncio.to_thread(self._apply_configure)
+            await asyncio.to_thread(self._apply_channel_maps)
+            # Sync so device responses to load_ccf / set_sample_group / load_channel_map
+            # are reflected in pycbsdk's local mirror before downstream readers
+            # (e.g., get_group_channels) consult it.
+            await asyncio.to_thread(self.state.session.sync)
+            self._cache_channel_metadata()
+            self._setup_subscription(loop)
+        except BaseException:
+            # Release fds before propagating; outer ``_areset_state`` would also
+            # call ``_teardown_state`` on Exception, but doing it here covers
+            # BaseException too (KeyboardInterrupt, SystemExit).
+            try:
+                await asyncio.to_thread(self.state.session.__exit__, None, None, None)
+            except Exception:
+                logger.exception("CereLink: cleanup-after-failure also failed")
+            self.state.session = None
+            raise
+
+    def _apply_configure(self) -> None:
+        """Apply CcfConfig / SliceConfig device state. Sync — runs in a thread."""
+        cfg = self.settings.configure
+        if cfg is None:
+            return
+        if isinstance(cfg, CcfConfig):
+            self.state.session.load_ccf_sync(cfg.path)
+            return
+        # SliceConfig
+        self._apply_slice_configure(cfg)
+        if cfg.ac_input_coupling:
+            self.state.session.set_ac_input_coupling(cfg.channels, cfg.channel_type, True)
+
+    def _apply_slice_configure(self, cfg: SliceConfig) -> None:
+        """Subclass hook: stream-specific slice config (sample-group OR spike-extract)."""
+        raise NotImplementedError
+
+    def _apply_channel_maps(self) -> None:
+        for cmp_cfg in self.settings.cmp_configs:
+            if cmp_cfg.filepath:
+                self.state.session.load_channel_map(cmp_cfg.filepath, cmp_cfg.start_chan, cmp_cfg.hs_id)
+
+    def _cache_channel_metadata(self) -> None:
+        all_ids = self.state.session.get_matching_channel_ids(ChannelType.FRONTEND)
+        all_pos = self.state.session.get_channels_positions(ChannelType.FRONTEND)
+        self.state.ch_positions = dict(zip(all_ids, all_pos))
+
+    def _build_ch_info(self, channels: list[int]) -> np.ndarray:
+        n_ch = len(channels)
+        ch_info = np.zeros(n_ch, dtype=CHANNEL_DTYPE)
+        for i, ch_id in enumerate(channels):
+            label = self.state.session.get_channel_label(ch_id)
+            ch_info[i]["label"] = label or f"ch{ch_id}"
+            pos = self.state.ch_positions.get(ch_id, (0, 0, 0, 0))
+            ch_info[i]["x"] = pos[0]
+            ch_info[i]["y"] = pos[1]
+            ch_info[i]["bank"] = chr(ord("A") + pos[2] - 1) if pos[2] > 0 else ""
+            ch_info[i]["elec"] = pos[3]
+        return ch_info
+
+    def _setup_subscription(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Subclass hook: register pycbsdk callback, allocate buffer, build template."""
+        raise NotImplementedError
+
+    def update_settings(self, new_settings: _SettingsT) -> None:
+        """Override to apply ``cmp_configs`` in place when no other RESET field
+        changed — preserves the GUI-driven hot-CMP-swap workflow without a
+        Session restart."""
+        old_cmp = self.settings.cmp_configs
+        super().update_settings(new_settings)
+        if self._hash != -1 and old_cmp != self.settings.cmp_configs and self.state.session is not None:
+            self._reload_channel_maps_in_place()
+
+    def _reload_channel_maps_in_place(self) -> None:
+        """Apply current ``cmp_configs`` without restarting the Session.
+
+        ``clear_channel_map()`` resets pycbsdk's overlay so successive applies
+        don't accumulate. Subclasses rebuild their template's ``ch`` axis via
+        ``_on_channel_maps_reloaded``.
+        """
+        self.state.session.clear_channel_map()
+        for cfg in self.settings.cmp_configs:
+            if cfg.filepath:
+                self.state.session.load_channel_map(cfg.filepath, cfg.start_chan, cfg.hs_id)
+        self._cache_channel_metadata()
+        self._on_channel_maps_reloaded()
+
+    def _on_channel_maps_reloaded(self) -> None:
+        """Subclass hook: rebuild template's ``ch`` axis with refreshed positions."""
+        pass
+
+    def close(self) -> None:
+        """Synchronous teardown — for ``Source.shutdown()``. Releases the
+        Session and wakes any awaiters."""
+        self._on_teardown_pre_close()
+        if self.state.session is not None:
+            try:
+                self.state.session.__exit__(None, None, None)
+            except Exception:
+                logger.exception("CereLink: error during synchronous close")
+            self.state.session = None
+
+
+class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereLinkSignalProducerState]):
+    """Streams one continuous sample-group as :class:`AxisArray`."""
+
+    def _apply_slice_configure(self, cfg: SliceConfig) -> None:
+        rate = self.settings.subscribe_rate
+        self.state.session.set_sample_group(cfg.channels, cfg.channel_type, rate, disable_others=True)
+
+    def _setup_subscription(self, loop: asyncio.AbstractEventLoop) -> None:
+        rate = self.settings.subscribe_rate
+        channels = self.state.session.get_group_channels(int(rate))
+        if not channels:
+            self.state.n_channels = 0
+            return
+        n_ch = len(channels)
+        fs = rate.hz
+        buff_samples = max(1, int(self.settings.cont_buffer_dur * fs))
+
+        scale_factors = self._compute_scale_factors(channels)
+        ch_info = self._build_ch_info(channels)
+        time_ax = AxisArray.TimeAxis(fs, offset=0.0)
+        ch_ax = AxisArray.CoordinateAxis(data=ch_info, dims=["ch"], unit="struct")
+        template = AxisArray(
+            np.zeros((0, 0)),
+            dims=["time", "ch"],
+            axes={"time": time_ax, "ch": ch_ax},
+            key=rate.name,
+            attrs={"unit": "uV" if self.settings.microvolts else "raw"},
+        )
+
+        st = self.state
+        st.buffer_data = np.zeros((buff_samples, n_ch), dtype=np.int16)
+        st.buffer_timestamps = np.zeros(buff_samples, dtype=np.uint64)
+        st.write_idx = 0
+        st.read_idx = 0
+        st.n_channels = n_ch
+        st.template = template
+        st.scale_factors = scale_factors
+        st.data_event = asyncio.Event()
+
+        @st.session.on_group_batch(rate)
+        def _on_group_batch(samples, timestamps):
+            self._handle_group_batch(samples, timestamps, loop)
+
+    def _compute_scale_factors(self, channels: list[int]) -> np.ndarray:
+        sfs = []
+        for ch_id in channels:
+            scaling = self.state.session.get_channel_scaling(ch_id)
+            if scaling and scaling["digmax"] != scaling["digmin"]:
+                sf = (scaling["anamax"] - scaling["anamin"]) / (scaling["digmax"] - scaling["digmin"])
+                if scaling["anaunit"] == "mV":
+                    sf *= 1000  # mV -> uV
+                sfs.append(sf)
+            else:
+                sfs.append(1.0)
+        return np.array(sfs, dtype=np.float64)
+
+    def _handle_group_batch(
+        self,
+        samples: np.ndarray,
+        timestamps: np.ndarray,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        st = self.state
+        n_ch = st.n_channels
+        if samples.shape[1] > n_ch:
+            samples = samples[:, :n_ch]  # drop dword-padding columns
+        w = st.write_idx
+        n = len(timestamps)
+        buff_len = len(st.buffer_timestamps)
+        end = w + n
+        if end <= buff_len:
+            st.buffer_data[w:end, :] = samples
+            st.buffer_timestamps[w:end] = timestamps
+        else:
+            first = buff_len - w
+            st.buffer_data[w:buff_len, :] = samples[:first]
+            st.buffer_timestamps[w:buff_len] = timestamps[:first]
+            rest = n - first
+            st.buffer_data[:rest, :] = samples[first:]
+            st.buffer_timestamps[:rest] = timestamps[first:]
+        st.write_idx = end % buff_len
+        if loop.is_running():
+            loop.call_soon_threadsafe(st.data_event.set)
+        else:
+            st.data_event.set()
+
+    def _on_teardown_pre_close(self) -> None:
+        if self.state.data_event is not None:
+            self.state.data_event.set()
+
+    def _on_channel_maps_reloaded(self) -> None:
+        rate = self.settings.subscribe_rate
+        channels = self.state.session.get_group_channels(int(rate))
+        if not channels or self.state.template is None:
+            return
+        ch_info = self._build_ch_info(channels)
+        new_ch_ax = AxisArray.CoordinateAxis(data=ch_info, dims=["ch"], unit="struct")
+        old = self.state.template
+        self.state.template = replace(old, axes={**old.axes, "ch": new_ch_ax})
+
+    async def _produce(self) -> AxisArray | None:
+        st = self.state
+        if st.session is None or st.n_channels == 0:
+            await asyncio.sleep(0.1)
+            return None
+        while True:
+            read_idx = st.read_idx
+            write_idx = st.write_idx
+            buff_len = len(st.buffer_timestamps)
+            read_term = write_idx if write_idx >= read_idx else buff_len
+            if read_idx == read_term:
+                st.data_event.clear()
+                await st.data_event.wait()
+                if st.session is None:  # closed while waiting
+                    return None
+                continue
+
+            read_slice = slice(read_idx, read_term)
+            out_dat = st.buffer_data[read_slice].copy()
+            if self.settings.microvolts:
+                out_dat = out_dat * st.scale_factors[None, :]
+
+            first_ts = int(st.buffer_timestamps[read_idx])
+            if self.settings.cbtime:
+                new_offset = first_ts / 1e9
+            else:
+                try:
+                    new_offset = st.session.device_to_monotonic(first_ts)
+                except RuntimeError:
+                    new_offset = time.monotonic()
+
+            template = st.template
+            new_time_ax = replace(template.axes["time"], offset=new_offset)
+            result = replace(
+                template,
+                data=out_dat,
+                axes={**template.axes, "time": new_time_ax},
+            )
+            st.read_idx = read_term % buff_len
+            return result
+
+
+class CereLinkSignalSource(BaseProducerUnit[CereLinkSignalSettings, AxisArray, CereLinkSignalProducer]):
+    """ezmsg Unit that streams one continuous sample-group from a Blackrock device."""
+
+    SETTINGS = CereLinkSignalSettings
+    OUTPUT_DEVICE_STATUS = ez.OutputStream(DeviceStatus)
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Init in __init__ (not initialize) so the queue exists before
+        # device_status's coroutine could attach.
+        self._status_queue: asyncio.Queue[DeviceStatus] = asyncio.Queue()
+
+    def create_producer(self) -> None:
+        super().create_producer()
+        self.producer.set_status_callback(self._status_queue.put_nowait)
+
+    def shutdown(self) -> None:
+        self.producer.close()
+
+    @ez.publisher(OUTPUT_DEVICE_STATUS)
+    async def device_status(self) -> typing.AsyncGenerator:
+        while True:
+            status = await self._status_queue.get()
+            yield self.OUTPUT_DEVICE_STATUS, status

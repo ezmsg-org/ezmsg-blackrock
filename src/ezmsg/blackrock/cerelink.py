@@ -121,6 +121,118 @@ class CereLinkSettings(ez.Settings):
             raise ValueError("config_chans and config_rate must be set together (or neither)")
 
 
+# --- New settings shapes (Phase 1 of the split refactor) -------------------
+#
+# These types support the one-stream-per-source design. Old `CereLinkSettings`
+# above stays in place until Phase 4 cuts the new sources over.
+
+
+@dataclass
+class CcfConfig:
+    """Load a CCF file. Device-wide configuration — at most one source per
+    graph should carry this. Other sources targeting the same device set
+    ``configure=None`` (pure subscriber)."""
+
+    path: str
+
+
+@dataclass
+class SliceConfig:
+    """Programmatic per-slice device configuration owned by this source.
+
+    The source applies the device state needed to make its subscribed stream
+    produce data on ``channels``: ``set_sample_group`` for signal sources,
+    ``set_spike_extraction`` for spike sources, plus AC coupling.
+
+    Multiple sources can carry disjoint slices for the same device; pycbsdk
+    handles the merge. Overlap with incompatible settings is the user's
+    responsibility.
+    """
+
+    channels: list[int] | None = None
+    """1-based channel IDs to configure. ``None`` = all matching ``channel_type``."""
+
+    channel_type: ChannelType = ChannelType.FRONTEND
+
+    ac_input_coupling: bool = False
+    """Apply AC coupling (highpass filter) on this slice."""
+
+    enable_spiking: bool = False
+    """Enable spike extraction on this slice (FRONTEND only). Honored by
+    :class:`CereLinkSpikeSource`; ignored by signal sources."""
+
+
+DeviceConfig = CcfConfig | SliceConfig | None
+"""Device-configuration mode for one source. ``None`` means another source
+or component owns the device config; this source only subscribes."""
+
+
+class CereLinkSignalSettings(ez.Settings):
+    """Settings for :class:`CereLinkSignalSource` — emits one continuous
+    sample-group as :class:`AxisArray`."""
+
+    device_type: DeviceType | None = None
+    """Device to connect to. ``None`` = idle (no Session opened)."""
+
+    subscribe_rate: SampleRate = SampleRate.NONE
+    """Required. The sample-group rate this source streams.
+    ``SampleRate.NONE`` is rejected — pass a real rate."""
+
+    configure: DeviceConfig = None
+    """Device configuration this source applies on open."""
+
+    cbtime: bool = False
+    """True = raw device nanoseconds/1e9; False = ``time.monotonic()`` via clock sync."""
+
+    microvolts: bool = True
+    """Convert int16 → µV using channel scale factors."""
+
+    cont_buffer_dur: float = 0.5
+    """Ring buffer duration in seconds."""
+
+    cmp_configs: tuple[ChannelMapSettings, ...] = ()
+    """One :class:`ChannelMapSettings` per headstage applied after connection."""
+
+    def __post_init__(self):
+        if self.subscribe_rate == SampleRate.NONE:
+            raise ValueError(
+                "subscribe_rate is required and must be a real SampleRate "
+                "(SR_500, SR_1kHz, SR_2kHz, SR_10kHz, SR_30kHz, or SR_RAW)"
+            )
+
+
+class CereLinkSpikeSettings(ez.Settings):
+    """Settings for :class:`CereLinkSpikeSource` — emits sparse spike events
+    as :class:`AxisArray` of shape ``[time, ch, unit=7]`` at the 30 kHz
+    spike clock. Unit indices follow the device convention:
+    ``0=unsorted, 1..5=sorted, 6=noise (header.type > 5)``."""
+
+    device_type: DeviceType | None = None
+    """Device to connect to. ``None`` = idle."""
+
+    configure: DeviceConfig = None
+    """Device configuration this source applies on open."""
+
+    cbtime: bool = False
+    """True = raw device nanoseconds/1e9; False = ``time.monotonic()`` via clock sync."""
+
+    microvolts: bool = True
+    """Reserved for future spike-waveform emission — int16 → µV scaling."""
+
+    spike_buffer_dur: float = 0.5
+    """Ring buffer duration in seconds (at the 30 kHz spike clock)."""
+
+    cmp_configs: tuple[ChannelMapSettings, ...] = ()
+    """One :class:`ChannelMapSettings` per headstage applied after connection."""
+
+    def __post_init__(self):
+        # Symmetry with CereLinkSignalSettings; nothing to validate today.
+        pass
+
+
+# --- End of new settings shapes -------------------------------------------
+
+
 @processor_state
 class CereLinkProducerState:
     """Empty placeholder so :class:`CereLinkProducer` can be a stateful producer.

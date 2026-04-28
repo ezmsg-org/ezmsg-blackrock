@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 import typing
 from dataclasses import dataclass
@@ -1183,6 +1184,232 @@ class CereLinkSignalSource(BaseProducerUnit[CereLinkSignalSettings, AxisArray, C
         super().__init__(*args, **kwargs)
         # Init in __init__ (not initialize) so the queue exists before
         # device_status's coroutine could attach.
+        self._status_queue: asyncio.Queue[DeviceStatus] = asyncio.Queue()
+
+    def create_producer(self) -> None:
+        super().create_producer()
+        self.producer.set_status_callback(self._status_queue.put_nowait)
+
+    def shutdown(self) -> None:
+        self.producer.close()
+
+    @ez.publisher(OUTPUT_DEVICE_STATUS)
+    async def device_status(self) -> typing.AsyncGenerator:
+        while True:
+            status = await self._status_queue.get()
+            yield self.OUTPUT_DEVICE_STATUS, status
+
+
+# --- Spike producer/source (Phase 3 of the split refactor) -----------------
+#
+# Spikes are emitted as `AxisArray[time, ch, unit=7]` on a regular cadence
+# (`spike_buffer_dur`), with `time` at the device's 30 kHz spike clock and
+# `unit` indexing the device convention: 0=unsorted, 1..5=sorted, 6=noise.
+
+
+_SPIKE_FS = 30000  # device spike clock — fixed by the protocol
+_NS_PER_SECOND = 1_000_000_000
+_UNIT_LABELS = np.array(["unsorted", "1", "2", "3", "4", "5", "noise"], dtype="U8")
+
+
+@processor_state
+class CereLinkSpikeProducerState(_CereLinkSharedState):
+    """Spike-producer rolling buffer + emission template."""
+
+    buffer: np.ndarray | None = None  # uint8 [N_t, n_ch, 7]
+    n_channels: int = 0
+    n_t: int = 0
+    template: AxisArray | None = None
+    data_event: asyncio.Event | None = None
+    chid_to_buffer_idx: dict | None = None  # 1-based chid -> column index
+    window_origin_ns: int = -1  # device ts (ns) at buffer[0]; -1 = not yet aligned
+
+
+class CereLinkSpikeProducer(_CereLinkBaseProducer[CereLinkSpikeSettings, CereLinkSpikeProducerState]):
+    """Streams spike events as :class:`AxisArray` of shape ``[time, ch, unit=7]``.
+
+    Time axis is the device's 30 kHz spike clock; ``unit`` axis indexes the
+    device convention (0=unsorted, 1..5=sorted, 6=noise — values >5 collapse
+    into the noise bucket because the unit axis has fixed length 7).
+
+    Emission cadence is regular: every ``spike_buffer_dur`` seconds, one
+    window of shape ``[N_t, n_ch, 7]`` is emitted. Empty windows are emitted
+    too (downstream wants a steady time axis). The window before the first
+    spike is suppressed — there's no device-time anchor until then.
+
+    Spikes whose timestamp lands beyond the current window's range are
+    dropped (a downstream-backpressure failure mode); in normal operation
+    ``_produce`` runs at the buffer cadence and the buffer is large enough
+    to hold one window of spikes.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Guards state.buffer + state.window_origin_ns. Held by both the
+        # asyncio loop (in ``_produce``'s emit-and-reset) and the receive
+        # thread (in ``_handle_spike``'s sample-index compute + write).
+        # Without this lock, the full-buffer copy+zero in ``_produce`` races
+        # with per-spike increments — increments landing between copy and
+        # zero would be silently lost.
+        self._buffer_lock = threading.Lock()
+
+    def _apply_slice_configure(self, cfg: SliceConfig) -> None:
+        if cfg.enable_spiking:
+            self.state.session.set_spike_extraction(cfg.channels, cfg.channel_type, True)
+
+    def _setup_subscription(self, loop: asyncio.AbstractEventLoop) -> None:
+        cfg = self.settings.configure
+        if isinstance(cfg, SliceConfig):
+            channel_type = cfg.channel_type
+            if cfg.channels is not None:
+                channels = list(cfg.channels)
+            else:
+                channels = self.state.session.get_matching_channel_ids(channel_type)
+        else:
+            # CcfConfig or None: subscribe to all FRONTEND. The device's CCF
+            # (or whatever's already configured) decides which of these
+            # actually emit spikes; channels with spiking disabled simply
+            # never appear in the callback stream.
+            channel_type = ChannelType.FRONTEND
+            channels = self.state.session.get_matching_channel_ids(channel_type)
+
+        if not channels:
+            self.state.n_channels = 0
+            return
+
+        n_ch = len(channels)
+        n_t = max(1, int(self.settings.spike_buffer_dur * _SPIKE_FS))
+
+        ch_info = self._build_ch_info(channels)
+        time_ax = AxisArray.TimeAxis(float(_SPIKE_FS), offset=0.0)
+        ch_ax = AxisArray.CoordinateAxis(data=ch_info, dims=["ch"], unit="struct")
+        unit_ax = AxisArray.CoordinateAxis(data=_UNIT_LABELS.copy(), dims=["unit"], unit="label")
+        template = AxisArray(
+            np.zeros((0, 0, 0), dtype=np.uint8),
+            dims=["time", "ch", "unit"],
+            axes={"time": time_ax, "ch": ch_ax, "unit": unit_ax},
+            key="SPIKES",
+            attrs={"unit": "count"},
+        )
+
+        st = self.state
+        st.buffer = np.zeros((n_t, n_ch, 7), dtype=np.uint8)
+        st.n_channels = n_ch
+        st.n_t = n_t
+        st.template = template
+        st.data_event = asyncio.Event()
+        st.chid_to_buffer_idx = {ch_id: i for i, ch_id in enumerate(channels)}
+        st.window_origin_ns = -1
+
+        @st.session.on_event(channel_type)
+        def _on_event(header, data):
+            self._handle_spike(header, loop)
+
+    def _handle_spike(self, header, loop: asyncio.AbstractEventLoop) -> None:
+        st = self.state
+        ch_idx = st.chid_to_buffer_idx.get(header.chid)
+        if ch_idx is None:
+            return  # not subscribed to this channel (e.g., outside our slice)
+
+        # Clamp values >5 into the noise bucket so they fit the length-7 unit axis.
+        unit_idx = header.type if header.type < 6 else 6
+
+        spike_ts = header.time  # device ns
+        with self._buffer_lock:
+            if st.window_origin_ns == -1:
+                # Align the window to the first spike's timestamp; subsequent
+                # emissions advance by integer multiples of n_t samples.
+                st.window_origin_ns = spike_ts
+            if spike_ts < st.window_origin_ns:
+                return  # late arrival across a window boundary
+            # Integer arithmetic: ``sample_idx = (elapsed_ns * 30_000) // 1e9``.
+            # Avoids float truncation jitter that would push some spikes one
+            # bin too early. Device-side ns/tick rounding still produces ±1
+            # sample jitter, but that's intrinsic to pycbsdk's conversion.
+            elapsed_ns = spike_ts - st.window_origin_ns
+            sample_idx = (elapsed_ns * _SPIKE_FS) // _NS_PER_SECOND
+            if sample_idx >= st.n_t:
+                # Past the current window; without rotating the buffer here
+                # we drop. In normal operation _produce runs at the buffer
+                # cadence and this branch shouldn't hit. If it does
+                # repeatedly, downstream isn't keeping up.
+                return
+            st.buffer[sample_idx, ch_idx, unit_idx] += 1
+
+        if loop.is_running():
+            loop.call_soon_threadsafe(st.data_event.set)
+        else:
+            st.data_event.set()
+
+    def _on_teardown_pre_close(self) -> None:
+        if self.state.data_event is not None:
+            self.state.data_event.set()
+
+    def _on_channel_maps_reloaded(self) -> None:
+        st = self.state
+        if st.chid_to_buffer_idx is None or st.template is None:
+            return
+        # chid_to_buffer_idx ordering is preserved across CMP reloads — only
+        # positions/labels change, so we rebuild the ch axis in place.
+        channels = sorted(st.chid_to_buffer_idx, key=st.chid_to_buffer_idx.get)
+        ch_info = self._build_ch_info(channels)
+        new_ch_ax = AxisArray.CoordinateAxis(data=ch_info, dims=["ch"], unit="struct")
+        old = st.template
+        st.template = replace(old, axes={**old.axes, "ch": new_ch_ax})
+
+    async def _produce(self) -> AxisArray | None:
+        st = self.state
+        if st.session is None or st.n_channels == 0:
+            await asyncio.sleep(0.1)
+            return None
+
+        if st.window_origin_ns == -1:
+            # Block until the first spike sets the window origin. The session
+            # close path triggers data_event so this returns cleanly.
+            await st.data_event.wait()
+            if st.session is None or st.window_origin_ns == -1:
+                return None
+
+        # Regular cadence — one window per ``spike_buffer_dur``. The sleep
+        # timer is independent of the device clock; window time-axis offsets
+        # are computed from ``window_origin_ns`` so they remain aligned to
+        # the device regardless of small drifts in _produce's schedule.
+        await asyncio.sleep(self.settings.spike_buffer_dur)
+        if st.session is None:
+            return None
+
+        with self._buffer_lock:
+            out_data = st.buffer.copy()
+            st.buffer[:] = 0
+            emit_origin_ns = st.window_origin_ns
+            # Advance origin by one buffer's worth of samples in integer ns.
+            # ``ceil_div`` rather than floor avoids overlap between successive
+            # windows: window K covers [origin, origin + advance_ns), and
+            # window K+1 starts at origin + advance_ns.
+            advance_ns = (st.n_t * _NS_PER_SECOND + _SPIKE_FS - 1) // _SPIKE_FS
+            st.window_origin_ns += advance_ns
+
+        if self.settings.cbtime:
+            new_offset = emit_origin_ns / 1e9
+        else:
+            try:
+                new_offset = st.session.device_to_monotonic(emit_origin_ns)
+            except RuntimeError:
+                new_offset = time.monotonic()
+
+        template = st.template
+        new_time_ax = replace(template.axes["time"], offset=new_offset)
+        return replace(template, data=out_data, axes={**template.axes, "time": new_time_ax})
+
+
+class CereLinkSpikeSource(BaseProducerUnit[CereLinkSpikeSettings, AxisArray, CereLinkSpikeProducer]):
+    """ezmsg Unit that streams spike events as `AxisArray[time, ch, unit=7]`."""
+
+    SETTINGS = CereLinkSpikeSettings
+    OUTPUT_DEVICE_STATUS = ez.OutputStream(DeviceStatus)
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self._status_queue: asyncio.Queue[DeviceStatus] = asyncio.Queue()
 
     def create_producer(self) -> None:

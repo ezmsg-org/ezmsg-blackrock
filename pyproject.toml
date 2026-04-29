@@ -12,7 +12,7 @@ dependencies = [
     "ezmsg-baseproc>=1.9.0",
     "ezmsg-event",
     "ezmsg>=3.6.1",
-    "pycbsdk>=9.8.0",
+    "pycbsdk>=9.9.0",
     "scipy",
 ]
 

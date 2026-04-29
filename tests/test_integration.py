@@ -111,8 +111,11 @@ class TestCereLinkSignalSource:
         ), f"non-monotonic at (idx, prev, next): {violations}; offsets[0]={offsets[0]}, offsets[-1]={offsets[-1]}"
 
     def test_all_channels(self, nplayserver, tmp_path):
-        """`SliceConfig(channels=None)` configures all matching channels."""
-        n_ch = 4  # 4-channel test data
+        """`SliceConfig(channels=None)` configures all matching FRONTEND channels.
+        NPLAY emulates the full NSP channel layout (256 FRONTEND), so even
+        with a 4-channel recording the AxisArray has 256 columns — the
+        unrecorded channels carry zeros but are still configured."""
+        expected_n_ch = 256  # NPLAY's nominal FRONTEND count
         messages = _run_signal_source(
             CereLinkSignalSettings(
                 device_type=DeviceType.NPLAY,
@@ -125,7 +128,7 @@ class TestCereLinkSignalSource:
         )
         assert len(messages) >= N_MESSAGES
         for msg in messages:
-            assert msg.data.shape[1] == n_ch
+            assert msg.data.shape[1] == expected_n_ch
 
     def test_offsets_near_monotonic(self, nplayserver, tmp_path):
         """Verify time offsets are close to time.monotonic() (cbtime=False)."""

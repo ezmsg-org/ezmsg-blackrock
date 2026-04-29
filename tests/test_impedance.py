@@ -54,6 +54,142 @@ class TestExtractImpedance:
         assert result is None
 
 
+class TestExtractImpedanceRobustness:
+    """Off-bin tones, non-integer cycles, and white noise.
+
+    The existing ``test_known_impedance`` uses ``fft_duration_s=0.09`` which
+    happens to give exactly 90 cycles of 1 kHz at 30 kHz fs (bin-aligned and
+    cycle-aligned — the most favourable case). The production default is
+    ``0.09227`` which puts 1 kHz at bin 92.27 with 92.27 cycles, exercising
+    the band-summed Hann FFT path. These tests verify the algorithm's
+    accuracy under those (and worse) conditions.
+    """
+
+    # Production defaults — 1 kHz lands at bin 92.27 (NOT bin-aligned), with
+    # 92.27 cycles per window (NOT cycle-aligned).
+    FFT_DURATION_S = 0.09227
+    FFT_SAMPLES = int(FFT_DURATION_S * FS)  # 2768
+    FREQ_LO = 960.0
+    FREQ_HI = 1050.0
+
+    @pytest.mark.parametrize(
+        "freq_hz",
+        [
+            980.0,  # off-bin, 90 cycles/window
+            1000.0,  # production tone, off-bin (bin 92.27)
+            1003.71,  # arbitrary off-bin
+            1010.0,  # off-bin, near upper half of band
+            1020.0,  # main lobe still inside the mask
+        ],
+    )
+    def test_off_bin_tone_recovery(self, freq_hz):
+        """A pure tone at any frequency well inside the mask should be
+        recovered to within ~1% by the band-summed Hann estimator —
+        regardless of where it falls relative to FFT bins."""
+        expected_kohm = 220.0
+        amp_uv = expected_kohm * TEST_CURRENT_NA / 2.0
+        signal = _sine_burst(self.FFT_SAMPLES, freq_hz, amp_uv)
+        result = extract_impedance(signal, self.FFT_SAMPLES, FS, self.FREQ_LO, self.FREQ_HI, TEST_CURRENT_NA)
+        assert result is not None
+        assert result == pytest.approx(
+            expected_kohm, rel=0.01
+        ), f"freq={freq_hz} Hz: expected {expected_kohm} kOhm, got {result:.3f}"
+
+    @pytest.mark.parametrize(
+        "fft_samples,freq_hz,label",
+        [
+            (2700, 1000.0, "bin-aligned, integer cycles (favourable)"),
+            (2701, 1000.0, "+1 sample → off bin, off cycle"),
+            (2730, 1000.0, "91 integer cycles, off bin"),
+            (2768, 1000.0, "production default, off bin AND off cycle"),
+            (3001, 1000.0, "off bin, off cycle"),
+            (2700, 1003.7, "bin width = 11.11 Hz, tone off bin"),
+        ],
+    )
+    def test_non_integer_cycles(self, fft_samples, freq_hz, label):
+        """Verifies that fft_samples not being a multiple of one cycle of
+        the test tone does not under-report the amplitude. Hann main lobe
+        spans ±2 bins, so as long as the band brackets it, Parseval recovers
+        the energy regardless of cycle alignment."""
+        expected_kohm = 220.0
+        amp_uv = expected_kohm * TEST_CURRENT_NA / 2.0
+        signal = _sine_burst(fft_samples, freq_hz, amp_uv)
+        result = extract_impedance(signal, fft_samples, FS, self.FREQ_LO, self.FREQ_HI, TEST_CURRENT_NA)
+        assert result is not None
+        assert result == pytest.approx(
+            expected_kohm, rel=0.02
+        ), f"{label}: N={fft_samples}, f={freq_hz} → got {result:.3f} kOhm"
+
+    def test_220_kohm_off_bin_no_underestimate(self):
+        """Specifically reproduces the user's reported 220 kOhm test rig
+        condition under production fft window settings, with the tone
+        intentionally off-bin. The algorithm itself should NOT explain a
+        220 → 200 kOhm under-read."""
+        expected_kohm = 220.0
+        amp_uv = expected_kohm * TEST_CURRENT_NA / 2.0
+        signal = _sine_burst(self.FFT_SAMPLES, 1000.0, amp_uv)
+        result = extract_impedance(signal, self.FFT_SAMPLES, FS, self.FREQ_LO, self.FREQ_HI, TEST_CURRENT_NA)
+        assert result is not None
+        # If the algorithm caused a 9% underestimate this would land at 200 kOhm.
+        # Tight tolerance: anything beyond ~1% needs investigation.
+        assert result == pytest.approx(expected_kohm, rel=0.01)
+        assert result > 217.0, (
+            f"Got {result:.2f} kOhm — algorithm underestimates by more than 1.5%, "
+            "which would partially explain the 220 → 200 reading."
+        )
+
+    @pytest.mark.parametrize("noise_rms_uv", [1.0, 5.0, 20.0])
+    def test_white_noise_biases_upward_not_downward(self, noise_rms_uv):
+        """White noise integrated in [freq_lo, freq_hi] adds power to the
+        sum-of-squares estimate, so it raises the impedance estimate.
+        White noise can NOT explain a systematic underestimate."""
+        expected_kohm = 220.0
+        amp_uv = expected_kohm * TEST_CURRENT_NA / 2.0
+        rng = np.random.default_rng(42)
+
+        # Average over trials so single-realisation variance doesn't drown
+        # the (small, upward) mean bias.
+        n_trials = 200
+        results = []
+        for _ in range(n_trials):
+            sig = _sine_burst(self.FFT_SAMPLES, FREQ_HZ, amp_uv)
+            sig = sig + rng.normal(0, noise_rms_uv, self.FFT_SAMPLES)
+            r = extract_impedance(sig, self.FFT_SAMPLES, FS, self.FREQ_LO, self.FREQ_HI, TEST_CURRENT_NA)
+            assert r is not None
+            results.append(r)
+        mean_kohm = float(np.mean(results))
+
+        # The estimator's mean is >= true value (with equality at zero noise).
+        # Allow a small tolerance (~0.2% of expected) for finite-sample variance.
+        assert mean_kohm >= expected_kohm - 0.5, (
+            f"σ={noise_rms_uv} uV: noise produced a DOWNWARD bias "
+            f"(mean {mean_kohm:.3f} kOhm < {expected_kohm}) — unexpected."
+        )
+        # Sanity upper bound: noise contribution << signal at these levels.
+        assert mean_kohm < expected_kohm * 1.05
+
+    def test_white_noise_only_yields_small_floor(self):
+        """With pure white noise (no tone), the estimator returns a small
+        positive 'noise floor' value — documents the lower bound the user
+        might see on a disconnected channel."""
+        rng = np.random.default_rng(0)
+        noise_rms_uv = 5.0
+        n_trials = 500
+        results = []
+        for _ in range(n_trials):
+            sig = rng.normal(0, noise_rms_uv, self.FFT_SAMPLES)
+            r = extract_impedance(sig, self.FFT_SAMPLES, FS, self.FREQ_LO, self.FREQ_HI, TEST_CURRENT_NA)
+            if r is not None:
+                results.append(r)
+
+        # Theoretical: A_est ≈ 2σ·sqrt(K/N) where K≈8 mask bins, N=2768.
+        # → ≈ 2·5·sqrt(8/2768) ≈ 0.54 uV ⇒ ≈ 1.07 kOhm (p2p / 1 nA).
+        mean_kohm = float(np.mean(results))
+        assert 0.3 < mean_kohm < 3.0, (
+            f"Mean noise-floor reading {mean_kohm:.3f} kOhm outside expected " "0.3–3 kOhm window for σ=5 uV."
+        )
+
+
 class TestCerePlexImpedanceProcessor:
     """Tests for the full processor with synthetic sequential impedance sweeps."""
 

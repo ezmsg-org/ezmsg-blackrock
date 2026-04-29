@@ -74,7 +74,9 @@ class SliceConfig:
     channel_type: ChannelType = ChannelType.FRONTEND
 
     ac_input_coupling: bool = False
-    """Apply AC coupling (highpass filter) on this slice."""
+    """Enable (True) or disable (False) AC coupling (highpass filter) on this slice.
+    Note: This is applied unconditionally to CereLinkSignalProducer.
+    """
 
     enable_spiking: bool = False
     """Enable spike extraction on this slice (FRONTEND only). Honored by
@@ -291,8 +293,6 @@ class _CereLinkBaseProducer(
             return
         # SliceConfig
         self._apply_slice_configure(cfg)
-        if cfg.ac_input_coupling:
-            self.state.session.set_ac_input_coupling(cfg.channels, cfg.channel_type, True)
 
     def _apply_slice_configure(self, cfg: SliceConfig) -> None:
         """Subclass hook: stream-specific slice config (sample-group OR spike-extract)."""
@@ -369,7 +369,9 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
 
     def _apply_slice_configure(self, cfg: SliceConfig) -> None:
         rate = self.settings.subscribe_rate
-        self.state.session.set_sample_group(cfg.channels, cfg.channel_type, rate, disable_others=True)
+        if self.state.session is not None:
+            self.state.session.set_sample_group(cfg.channels, cfg.channel_type, rate, disable_others=True)
+            self.state.session.set_ac_input_coupling(cfg.channels, cfg.channel_type, cfg.ac_input_coupling)
 
     def _setup_subscription(self, loop: asyncio.AbstractEventLoop) -> None:
         rate = self.settings.subscribe_rate

@@ -9,7 +9,11 @@ import pytest
 from conftest import run_nplayserver
 from pycbsdk import ChannelType, DeviceType, SampleRate
 
-from ezmsg.blackrock.cerelink import CereLinkProducer, CereLinkSettings
+from ezmsg.blackrock.cerelink import (
+    CereLinkSignalProducer,
+    CereLinkSignalSettings,
+    SliceConfig,
+)
 from ezmsg.blackrock.cereplex_impedance import CerePlexImpedanceProcessor, CerePlexImpedanceSettings
 
 pytestmark = pytest.mark.integration
@@ -38,29 +42,32 @@ def nplayserver(nplayserver_binary, ns6_impedance_path, tmp_path_factory):
 
 def test_impedance_from_playback(nplayserver):
     """Play back real impedance data, run through the processor, verify values."""
-    producer = CereLinkProducer(
-        settings=CereLinkSettings(
+    producer = CereLinkSignalProducer(
+        settings=CereLinkSignalSettings(
             device_type=DeviceType.NPLAY,
-            config_chans=128,
-            config_chan_type=ChannelType.FRONTEND,
-            config_rate=SampleRate.SR_RAW,
-            ac_input_coupling=False,
+            subscribe_rate=SampleRate.SR_RAW,
+            configure=SliceConfig(
+                channels=list(range(1, 129)),
+                channel_type=ChannelType.FRONTEND,
+                ac_input_coupling=False,
+            ),
             microvolts=True,
             cbtime=False,
         )
     )
-    producer.open()
 
     loop = asyncio.new_event_loop()
-    producer._loop = loop
-
     proc = CerePlexImpedanceProcessor(settings=CerePlexImpedanceSettings(headstage_channel_offsets=(0,)))
 
     try:
+        # `_areset_state` is the new producer's open hook — it captures the
+        # running event loop, opens the Session, and registers callbacks.
+        loop.run_until_complete(producer._areset_state())
         deadline = time.monotonic() + COLLECT_DURATION_S
         while time.monotonic() < deadline:
             msg = loop.run_until_complete(producer._produce())
-            proc(msg)
+            if msg is not None:
+                proc(msg)
     finally:
         producer.close()
         loop.close()

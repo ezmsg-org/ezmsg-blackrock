@@ -87,7 +87,7 @@ def extract_impedance(
     .. important::
        *data* must be in **microvolts**. Passing raw ADC counts will produce
        impedance values that are wrong by the ADC scale factor.
-       When using :class:`CereLinkSource`, set ``microvolts=True``.
+       When using :class:`CereLinkSignalSource`, set ``microvolts=True``.
 
     Args:
         data: 1-D array of samples for a single channel burst, in microvolts.
@@ -178,7 +178,7 @@ class CerePlexImpedanceProcessor(
     """Stateful transformer that extracts per-channel impedance from a CerePlex sweep.
 
     Expects a stream of ``AxisArray`` messages with dims ``["time", "ch"]``
-    where the data is in **microvolts**. When using :class:`CereLinkSource`,
+    where the data is in **microvolts**. When using :class:`CereLinkSignalSource`,
     set ``microvolts=True``; raw ADC counts will produce incorrect results.
 
     The processor tracks one or more headstages independently (configured via

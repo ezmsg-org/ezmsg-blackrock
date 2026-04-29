@@ -1,4 +1,4 @@
-"""Benchmark device-to-subscriber latency for CereLinkSource.
+"""Benchmark device-to-subscriber latency for CereLinkSignalSource.
 
 Requires a running Blackrock device or nPlayServer.
 Collects latency statistics and optionally plots a histogram.
@@ -20,10 +20,10 @@ import numpy as np
 import typer
 from ezmsg.util.messagecodec import LogStart
 from ezmsg.util.terminate import TerminateOnTotal
-from pycbsdk import DeviceType
+from pycbsdk import DeviceType, SampleRate
 from typing_extensions import Annotated
 
-from ezmsg.blackrock.cerelink import CereLinkSettings, CereLinkSource
+from ezmsg.blackrock.cerelink import CereLinkSignalSettings, CereLinkSignalSource, SliceConfig
 
 
 class _LatencyEncoder(mc.MessageEncoder):
@@ -58,9 +58,11 @@ def main(
 
     try:
         comps = {
-            "SOURCE": CereLinkSource(
-                CereLinkSettings(
+            "SOURCE": CereLinkSignalSource(
+                CereLinkSignalSettings(
                     device_type=DeviceType[device_type.upper()],
+                    subscribe_rate=SampleRate.SR_30kHz,
+                    configure=SliceConfig(),  # all FRONTEND channels
                     microvolts=False,
                     cbtime=False,
                 )

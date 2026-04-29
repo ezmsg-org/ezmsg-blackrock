@@ -1,12 +1,14 @@
 """Shared test fixtures for ezmsg-blackrock."""
 
 import ast
+import atexit
 import base64
 import ctypes
 import ctypes.util
 import json
 import os
 import platform
+import signal
 import subprocess
 import sys
 import time
@@ -113,6 +115,26 @@ def read_log(path: Path) -> list:
     return messages
 
 
+def _force_kill_proc(proc: subprocess.Popen) -> None:
+    """SIGKILL the process group, falling back to SIGKILL on the leader.
+
+    Used as an atexit fallback so a stranded ``nPlayServer`` can't outlive
+    pytest when ``pytest-timeout`` interrupts the fixture's ``finally``
+    block before it runs (the timeout signal can land between ``yield`` and
+    cleanup, leaving the child holding UDP 51001 and breaking subsequent
+    runs with err 48).
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
 @contextmanager
 def run_nplayserver(binary: Path, ns6: Path):
     """Context manager: start nPlayServer, yield the process, kill on exit."""
@@ -120,6 +142,8 @@ def run_nplayserver(binary: Path, ns6: Path):
     _lock_counter += 1
     lock_name = f"nplay_test_{os.getpid()}_{_lock_counter}"
 
+    # ``start_new_session=True`` puts the child in its own process group so
+    # ``os.killpg`` reliably tears down nPlayServer + any grandchildren.
     proc = subprocess.Popen(
         [
             str(binary),
@@ -132,14 +156,22 @@ def run_nplayserver(binary: Path, ns6: Path):
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        start_new_session=True,
     )
+
+    # Register an atexit hook that kills the process group if the fixture's
+    # ``finally`` block doesn't run (pytest-timeout's signal-based cancellation
+    # can interrupt before cleanup). Unregistered on the normal cleanup path.
+    fallback_kill = lambda p=proc: _force_kill_proc(p)  # noqa: E731
+    atexit.register(fallback_kill)
 
     time.sleep(3)
 
     if proc.poll() is not None:
         stdout = proc.stdout.read().decode(errors="replace") if proc.stdout else ""
         stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
-        pytest.fail(f"nPlayServer exited immediately (rc={proc.returncode})\n" f"stdout: {stdout}\nstderr: {stderr}")
+        atexit.unregister(fallback_kill)
+        pytest.fail(f"nPlayServer exited immediately (rc={proc.returncode})\nstdout: {stdout}\nstderr: {stderr}")
 
     try:
         yield proc
@@ -148,9 +180,10 @@ def run_nplayserver(binary: Path, ns6: Path):
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _force_kill_proc(proc)
             proc.wait()
         _sem_unlink(lock_name)
+        atexit.unregister(fallback_kill)
 
 
 # -- Data path fixtures (session-scoped) --------------------------------------

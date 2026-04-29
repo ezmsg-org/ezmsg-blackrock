@@ -1,7 +1,18 @@
 from pycbsdk import DeviceType
 
 from .__version__ import __version__ as __version__
-from .cerelink import CereLinkProducer, CereLinkSettings, CereLinkSource
+from .cerelink import (
+    CcfConfig,
+    CereLinkSignalProducer,
+    CereLinkSignalSettings,
+    CereLinkSignalSource,
+    CereLinkSpikeProducer,
+    CereLinkSpikeSettings,
+    CereLinkSpikeSource,
+    DeviceConfig,
+    DeviceStatus,
+    SliceConfig,
+)
 from .cereplex_impedance import (
     CerePlexImpedance,
     CerePlexImpedanceProcessor,
@@ -16,9 +27,13 @@ from .channel_map import (
 
 __all__ = [
     "__version__",
-    "CereLinkProducer",
-    "CereLinkSettings",
-    "CereLinkSource",
+    "CcfConfig",
+    "CereLinkSignalProducer",
+    "CereLinkSignalSettings",
+    "CereLinkSignalSource",
+    "CereLinkSpikeProducer",
+    "CereLinkSpikeSettings",
+    "CereLinkSpikeSource",
     "CerePlexImpedance",
     "CerePlexImpedanceProcessor",
     "CerePlexImpedanceSettings",
@@ -26,5 +41,8 @@ __all__ = [
     "ChannelMapProcessor",
     "ChannelMapSettings",
     "ChannelMapUnit",
+    "DeviceConfig",
+    "DeviceStatus",
     "DeviceType",
+    "SliceConfig",
 ]

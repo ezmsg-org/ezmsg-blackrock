@@ -1,42 +1,109 @@
-"""Unit tests for CereLinkSettings validation (no hardware needed)."""
+"""Unit tests for CereLink settings validation (no hardware needed)."""
+
+import pickle
 
 import pytest
-from pycbsdk import SampleRate
+from pycbsdk import ChannelType, SampleRate
 
-from ezmsg.blackrock.cerelink import CereLinkSettings
+from ezmsg.blackrock.cerelink import (
+    CcfConfig,
+    CereLinkSignalSettings,
+    CereLinkSpikeSettings,
+    SliceConfig,
+)
 
 
-class TestSettingsValidation:
-    def test_defaults(self):
-        s = CereLinkSettings()
-        assert s.n_chans is None
-        assert s.sample_rate is None
-        assert s.ccf_path is None
+class TestSignalSettings:
+    def test_subscribe_rate_required(self):
+        """`SampleRate.NONE` is rejected — `subscribe_rate` must be a real rate."""
+        with pytest.raises(ValueError, match="subscribe_rate is required"):
+            CereLinkSignalSettings()
 
-    def test_n_chans_requires_sample_rate(self):
-        with pytest.raises(ValueError, match="sample_rate is required"):
-            CereLinkSettings(n_chans=8)
+    def test_explicit_none_rejected(self):
+        with pytest.raises(ValueError, match="subscribe_rate is required"):
+            CereLinkSignalSettings(subscribe_rate=SampleRate.NONE)
 
-    def test_sample_rate_without_n_chans_is_valid(self):
-        s = CereLinkSettings(sample_rate=SampleRate.SR_30kHz)
-        assert s.sample_rate == SampleRate.SR_30kHz
-        assert s.n_chans is None
+    def test_real_rate_accepted(self):
+        for rate in (
+            SampleRate.SR_500,
+            SampleRate.SR_1kHz,
+            SampleRate.SR_2kHz,
+            SampleRate.SR_10kHz,
+            SampleRate.SR_30kHz,
+            SampleRate.SR_RAW,
+        ):
+            s = CereLinkSignalSettings(subscribe_rate=rate)
+            assert s.subscribe_rate == rate
 
-    def test_n_chans_and_sample_rate_together(self):
-        s = CereLinkSettings(n_chans=8, sample_rate=SampleRate.SR_30kHz)
-        assert s.n_chans == 8
-        assert s.sample_rate == SampleRate.SR_30kHz
+    def test_idle_defaults(self):
+        s = CereLinkSignalSettings(subscribe_rate=SampleRate.SR_2kHz)
+        assert s.device_type is None
+        assert s.configure is None
+        assert s.cbtime is False
+        assert s.microvolts is True
+        assert s.cont_buffer_dur == pytest.approx(0.5)
+        assert s.cmp_configs == ()
 
-    def test_ccf_excludes_n_chans(self):
-        with pytest.raises(ValueError, match="mutually exclusive"):
-            CereLinkSettings(ccf_path="test.ccf", n_chans=8, sample_rate=SampleRate.SR_30kHz)
 
-    def test_ccf_excludes_sample_rate(self):
-        with pytest.raises(ValueError, match="mutually exclusive"):
-            CereLinkSettings(ccf_path="test.ccf", sample_rate=SampleRate.SR_30kHz)
+class TestSpikeSettings:
+    def test_idle_defaults(self):
+        s = CereLinkSpikeSettings()
+        assert s.device_type is None
+        assert s.configure is None
+        assert s.cbtime is False
+        assert s.microvolts is True
+        assert s.spike_buffer_dur == pytest.approx(0.5)
 
-    def test_ccf_alone_is_valid(self):
-        s = CereLinkSettings(ccf_path="test.ccf")
-        assert s.ccf_path == "test.ccf"
-        assert s.n_chans is None
-        assert s.sample_rate is None
+
+class TestConfigureUnion:
+    """`CereLinkSignalSettings.configure` accepts None, CcfConfig, or SliceConfig."""
+
+    def test_none(self):
+        s = CereLinkSignalSettings(subscribe_rate=SampleRate.SR_2kHz, configure=None)
+        assert s.configure is None
+
+    def test_ccf(self):
+        s = CereLinkSignalSettings(
+            subscribe_rate=SampleRate.SR_2kHz,
+            configure=CcfConfig(path="/tmp/x.ccf"),
+        )
+        assert isinstance(s.configure, CcfConfig)
+        assert s.configure.path == "/tmp/x.ccf"
+
+    def test_slice_defaults(self):
+        s = CereLinkSignalSettings(
+            subscribe_rate=SampleRate.SR_2kHz,
+            configure=SliceConfig(),
+        )
+        sc = s.configure
+        assert isinstance(sc, SliceConfig)
+        assert sc.channels is None  # all matching
+        assert sc.channel_type == ChannelType.FRONTEND
+        assert sc.ac_input_coupling is False
+        assert sc.enable_spiking is False
+
+    def test_slice_explicit_channels(self):
+        s = CereLinkSignalSettings(
+            subscribe_rate=SampleRate.SR_2kHz,
+            configure=SliceConfig(channels=[1, 2, 3], ac_input_coupling=True),
+        )
+        assert s.configure.channels == [1, 2, 3]
+        assert s.configure.ac_input_coupling is True
+
+
+class TestPickleRoundtrip:
+    """Settings + their nested configure types must survive pickling so they
+    can flow through ezmsg's INPUT_SETTINGS message stream."""
+
+    @pytest.mark.parametrize("cfg", [None, CcfConfig(path="/tmp/x.ccf"), SliceConfig(channels=[1, 2])])
+    def test_signal_roundtrip(self, cfg):
+        original = CereLinkSignalSettings(subscribe_rate=SampleRate.SR_2kHz, configure=cfg)
+        restored = pickle.loads(pickle.dumps(original))
+        assert restored.subscribe_rate == SampleRate.SR_2kHz
+        assert restored.configure == cfg
+
+    @pytest.mark.parametrize("cfg", [None, CcfConfig(path="/tmp/x.ccf"), SliceConfig(enable_spiking=True)])
+    def test_spike_roundtrip(self, cfg):
+        original = CereLinkSpikeSettings(configure=cfg)
+        restored = pickle.loads(pickle.dumps(original))
+        assert restored.configure == cfg

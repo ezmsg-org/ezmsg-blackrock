@@ -11,17 +11,21 @@ from ezmsg.util.messagelogger import MessageLogger
 from ezmsg.util.terminate import TerminateOnTotal
 from pycbsdk import ChannelType, DeviceType, SampleRate
 
-from ezmsg.blackrock.cerelink import CereLinkSettings, CereLinkSource
+from ezmsg.blackrock.cerelink import (
+    CereLinkSignalSettings,
+    CereLinkSignalSource,
+    SliceConfig,
+)
 
 pytestmark = pytest.mark.integration
 
 N_MESSAGES = 50
 
 
-def _run_source(settings: CereLinkSettings, log_path: Path, n_messages: int = N_MESSAGES) -> list:
-    """Run CereLinkSource, log messages, return deserialized AxisArray list."""
+def _run_signal_source(settings: CereLinkSignalSettings, log_path: Path, n_messages: int = N_MESSAGES) -> list:
+    """Run a `CereLinkSignalSource`, log messages, return deserialized AxisArrays."""
     comps = {
-        "SRC": CereLinkSource(settings),
+        "SRC": CereLinkSignalSource(settings),
         "LOG": MessageLogger(output=log_path),
         "TERM": TerminateOnTotal(total=n_messages),
     }
@@ -40,17 +44,19 @@ def nplayserver(nplayserver_binary, ns6_path):
         yield proc
 
 
-class TestCereLinkSource:
-    """CereLinkSource end-to-end tests (4-channel data, max n_chans=4)."""
+class TestCereLinkSignalSource:
+    """End-to-end tests for `CereLinkSignalSource` + `CereLinkSignalSettings`."""
 
     def test_receive_data(self, nplayserver, tmp_path):
         n_ch = 2
-        messages = _run_source(
-            CereLinkSettings(
+        messages = _run_signal_source(
+            CereLinkSignalSettings(
                 device_type=DeviceType.NPLAY,
-                n_chans=n_ch,
-                channel_type=ChannelType.FRONTEND,
-                sample_rate=SampleRate.SR_30kHz,
+                subscribe_rate=SampleRate.SR_30kHz,
+                configure=SliceConfig(
+                    channels=list(range(1, n_ch + 1)),
+                    channel_type=ChannelType.FRONTEND,
+                ),
                 microvolts=False,
                 cbtime=True,
             ),
@@ -67,12 +73,14 @@ class TestCereLinkSource:
 
     def test_microvolts(self, nplayserver, tmp_path):
         n_ch = 3
-        messages = _run_source(
-            CereLinkSettings(
+        messages = _run_signal_source(
+            CereLinkSignalSettings(
                 device_type=DeviceType.NPLAY,
-                n_chans=n_ch,
-                channel_type=ChannelType.FRONTEND,
-                sample_rate=SampleRate.SR_30kHz,
+                subscribe_rate=SampleRate.SR_30kHz,
+                configure=SliceConfig(
+                    channels=list(range(1, n_ch + 1)),
+                    channel_type=ChannelType.FRONTEND,
+                ),
                 microvolts=True,
                 cbtime=True,
             ),
@@ -85,12 +93,11 @@ class TestCereLinkSource:
             assert msg.attrs["unit"] == "uV"
 
     def test_monotonic_timestamps(self, nplayserver, tmp_path):
-        messages = _run_source(
-            CereLinkSettings(
+        messages = _run_signal_source(
+            CereLinkSignalSettings(
                 device_type=DeviceType.NPLAY,
-                n_chans=1,
-                channel_type=ChannelType.FRONTEND,
-                sample_rate=SampleRate.SR_30kHz,
+                subscribe_rate=SampleRate.SR_30kHz,
+                configure=SliceConfig(channels=[1], channel_type=ChannelType.FRONTEND),
                 microvolts=False,
                 cbtime=False,
             ),
@@ -99,18 +106,21 @@ class TestCereLinkSource:
         assert len(messages) >= N_MESSAGES
         offsets = [msg.axes["time"].offset for msg in messages]
         violations = [(i, offsets[i], offsets[i + 1]) for i in range(len(offsets) - 1) if offsets[i] > offsets[i + 1]]
-        assert not violations, (
-            f"non-monotonic at (idx, prev, next): {violations}; " f"offsets[0]={offsets[0]}, offsets[-1]={offsets[-1]}"
-        )
+        assert (
+            not violations
+        ), f"non-monotonic at (idx, prev, next): {violations}; offsets[0]={offsets[0]}, offsets[-1]={offsets[-1]}"
 
     def test_all_channels(self, nplayserver, tmp_path):
-        n_ch = 4
-        messages = _run_source(
-            CereLinkSettings(
+        """`SliceConfig(channels=None)` configures all matching FRONTEND channels.
+        NPLAY emulates the full NSP channel layout (256 FRONTEND), so even
+        with a 4-channel recording the AxisArray has 256 columns — the
+        unrecorded channels carry zeros but are still configured."""
+        expected_n_ch = 256  # NPLAY's nominal FRONTEND count
+        messages = _run_signal_source(
+            CereLinkSignalSettings(
                 device_type=DeviceType.NPLAY,
-                n_chans=n_ch,
-                channel_type=ChannelType.FRONTEND,
-                sample_rate=SampleRate.SR_30kHz,
+                subscribe_rate=SampleRate.SR_30kHz,
+                configure=SliceConfig(channel_type=ChannelType.FRONTEND),  # channels=None => all
                 microvolts=False,
                 cbtime=True,
             ),
@@ -118,17 +128,19 @@ class TestCereLinkSource:
         )
         assert len(messages) >= N_MESSAGES
         for msg in messages:
-            assert msg.data.shape[1] == n_ch
+            assert msg.data.shape[1] == expected_n_ch
 
     def test_offsets_near_monotonic(self, nplayserver, tmp_path):
         """Verify time offsets are close to time.monotonic() (cbtime=False)."""
         t_before = time.monotonic()
-        messages = _run_source(
-            CereLinkSettings(
+        messages = _run_signal_source(
+            CereLinkSignalSettings(
                 device_type=DeviceType.NPLAY,
-                n_chans=2,
-                channel_type=ChannelType.FRONTEND,
-                sample_rate=SampleRate.SR_30kHz,
+                subscribe_rate=SampleRate.SR_30kHz,
+                configure=SliceConfig(
+                    channels=[1, 2],
+                    channel_type=ChannelType.FRONTEND,
+                ),
                 microvolts=False,
                 cbtime=False,
             ),

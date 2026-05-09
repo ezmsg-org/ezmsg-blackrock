@@ -273,6 +273,11 @@ class _CereLinkBaseProducer(
             self._cache_channel_metadata()
             self._setup_subscription(loop)
         except BaseException:
+            logger.exception(
+                "CereLink: open_and_configure failed for device_type=%r, settings=%r",
+                self.settings.device_type,
+                self.settings,
+            )
             # Release fds before propagating; outer ``_areset_state`` would also
             # call ``_teardown_state`` on Exception, but doing it here covers
             # BaseException too (KeyboardInterrupt, SystemExit).

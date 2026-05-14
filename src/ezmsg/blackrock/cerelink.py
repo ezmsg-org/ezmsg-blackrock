@@ -318,6 +318,7 @@ class _CereLinkBaseProducer(
     def _build_ch_info(self, channels: list[int]) -> np.ndarray:
         n_ch = len(channels)
         ch_info = np.zeros(n_ch, dtype=CHANNEL_DTYPE)
+        device_name = self.settings.device_type.name.upper() if self.settings.device_type is not None else ""
         for i, ch_id in enumerate(channels):
             label = self.state.session.get_channel_label(ch_id)
             ch_info[i]["label"] = label or f"ch{ch_id}"
@@ -326,6 +327,7 @@ class _CereLinkBaseProducer(
             ch_info[i]["y"] = pos[1]
             ch_info[i]["bank"] = chr(ord("A") + pos[2] - 1) if pos[2] > 0 else ""
             ch_info[i]["elec"] = pos[3]
+            ch_info[i]["device"] = device_name
         return ch_info
 
     def _setup_subscription(self, loop: asyncio.AbstractEventLoop) -> None:

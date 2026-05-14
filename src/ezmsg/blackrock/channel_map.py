@@ -39,6 +39,7 @@ CHANNEL_DTYPE = np.dtype(
         ("label", "U16"),
         ("bank", "U1"),
         ("elec", "i4"),
+        ("device", "U16"),
     ]
 )
 
@@ -99,6 +100,12 @@ class ChannelMapProcessor(BaseStatefulTransformer[ChannelMapSettings, AxisArray,
             ch_data = np.zeros(n_total, dtype=CHANNEL_DTYPE)
             for i, label in enumerate(self._incoming_labels(message, n_total)):
                 ch_data[i]["label"] = label
+            # Carry through channel data fields in CHANNEL_DTYPE
+            #  other than label (above) and those in the CMP (below).
+            incoming = getattr(message.axes.get("ch"), "data", None)
+            if incoming is not None and incoming.dtype.names is not None and "device" in incoming.dtype.names:
+                for i in range(min(n_total, len(incoming))):
+                    ch_data[i]["device"] = incoming[i]["device"]
             self.state.channel_axis = CoordinateAxis(data=ch_data, dims=["ch"], unit="struct")
             self.state.cmp_mask = np.zeros(n_total, dtype=bool)
 

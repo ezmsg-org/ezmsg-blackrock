@@ -14,13 +14,12 @@ from ezmsg.blackrock.cerelink import (
 
 
 class TestSignalSettings:
-    def test_subscribe_rate_required(self):
-        """`SampleRate.NONE` is rejected — `subscribe_rate` must be a real rate."""
-        with pytest.raises(ValueError, match="subscribe_rate is required"):
-            CereLinkSignalSettings()
+    def test_default_subscribe_rate_is_sr_raw(self):
+        """Omitting ``subscribe_rate`` defaults to ``SR_RAW``."""
+        assert CereLinkSignalSettings().subscribe_rate == SampleRate.SR_RAW
 
     def test_explicit_none_rejected(self):
-        with pytest.raises(ValueError, match="subscribe_rate is required"):
+        with pytest.raises(ValueError, match="SampleRate.NONE is not allowed"):
             CereLinkSignalSettings(subscribe_rate=SampleRate.NONE)
 
     def test_real_rate_accepted(self):

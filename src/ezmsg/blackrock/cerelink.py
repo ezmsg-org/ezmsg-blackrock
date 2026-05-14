@@ -95,9 +95,10 @@ class CereLinkSignalSettings(ez.Settings):
     device_type: DeviceType | None = None
     """Device to connect to. ``None`` = idle (no Session opened)."""
 
-    subscribe_rate: SampleRate = SampleRate.NONE
-    """Required. The sample-group rate this source streams.
-    ``SampleRate.NONE`` is rejected — pass a real rate."""
+    subscribe_rate: SampleRate = SampleRate.SR_RAW
+    """The sample-group rate this source streams. Defaults to ``SR_RAW``.
+    Explicit ``SampleRate.NONE`` is rejected — a Source must subscribe to
+    something."""
 
     configure: DeviceConfig = None
     """Device configuration this source applies on open."""
@@ -117,8 +118,9 @@ class CereLinkSignalSettings(ez.Settings):
     def __post_init__(self):
         if self.subscribe_rate == SampleRate.NONE:
             raise ValueError(
-                "subscribe_rate is required and must be a real SampleRate "
-                "(SR_500, SR_1kHz, SR_2kHz, SR_10kHz, SR_30kHz, or SR_RAW)"
+                "subscribe_rate=SampleRate.NONE is not allowed; pass a real "
+                "SampleRate (SR_500, SR_1kHz, SR_2kHz, SR_10kHz, SR_30kHz, or "
+                "SR_RAW), or omit the argument to use the SR_RAW default."
             )
 
 

@@ -70,6 +70,8 @@ class TestCereLinkSignalSource:
             assert 1.0 / msg.axes["time"].gain == pytest.approx(30_000.0)
             assert msg.key == "SR_30kHz"
             assert msg.attrs["unit"] == "raw"
+            assert msg.attrs["manufacturer"] == "CereLink"
+            assert msg.attrs["device"] == "NPLAY"
 
     def test_microvolts(self, nplayserver, tmp_path):
         n_ch = 3
@@ -91,6 +93,8 @@ class TestCereLinkSignalSource:
             assert msg.data.shape[1] == n_ch
             assert msg.data.dtype == np.float64
             assert msg.attrs["unit"] == "uV"
+            assert msg.attrs["manufacturer"] == "CereLink"
+            assert msg.attrs["device"] == "NPLAY"
 
     def test_monotonic_timestamps(self, nplayserver, tmp_path):
         messages = _run_signal_source(

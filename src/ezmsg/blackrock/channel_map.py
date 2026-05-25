@@ -3,21 +3,27 @@
 The output ``ch`` axis is a structured ``CoordinateAxis`` with fields
 ``x``, ``y``, ``label``, ``bank``, ``elec`` for every input channel.
 
+:class:`ChannelMapUnit` takes the *complete* set of per-headstage overlays in
+one settings object (:class:`ChannelMapUnitSettings`, a tuple of
+:class:`ChannelMapSettings`) and rebuilds the ``ch`` axis from scratch on each
+reset. One settings push = the whole map, applied deterministically — there is
+no cross-push accumulation that could coalesce if pushes aren't separated by a
+data message. An empty tuple clears the map (pure auto-grid).
+
 Each reset proceeds in three phases:
 
-1. **Base layer** — labels are pulled from the incoming ``ch`` axis. The
-   axis object is built once per ``n_ch`` and reused across resets so
-   successive CMP pushes accumulate into one composite map.
-2. **CMP overlay** — entries from :func:`pycbsdk.cmp.parse_cmp` are written
-   at indices ``chan_id - 1`` (with ``chan_id`` offset by ``start_chan``).
-   A companion ``cmp_mask`` records which indices were set so the auto-grid
-   pass can avoid them.
-3. **Auto-grid fill** — positions/bank/elec for indices NOT covered by the
+1. **Base layer** — labels are pulled from the incoming ``ch`` axis.
+2. **CMP overlays** — for each :class:`ChannelMapSettings` in ``cmp_configs``,
+   entries from :func:`pycbsdk.cmp.parse_cmp` are written at indices
+   ``chan_id - 1`` (with ``chan_id`` offset by ``start_chan``). A companion
+   ``cmp_mask`` records which indices were set so the auto-grid pass can avoid
+   them.
+3. **Auto-grid fill** — positions/bank/elec for indices NOT covered by any
    CMP, laid out below and to the right of the CMP geometry so they don't
    collide with CMP positions.
 
-Pushing ``filepath=None`` (or an empty path) clears the accumulated
-overlay so the next reset rebuilds the base from scratch.
+The same :class:`ChannelMapSettings` record is also used as a per-headstage
+entry in :attr:`CereLinkSignalSettings.cmp_configs`.
 """
 
 import logging
@@ -58,76 +64,65 @@ class ChannelMapSettings(ez.Settings):
     Pass ``0`` (the default) to leave labels un-prefixed."""
 
 
+class ChannelMapUnitSettings(ez.Settings):
+    cmp_configs: tuple[ChannelMapSettings, ...] = ()
+    """Per-headstage overlays, applied in order on each reset. Empty (the
+    default) means no CMP — the auto-grid lays out every channel."""
+
+
 @processor_state
 class ChannelMapState:
     channel_axis: CoordinateAxis | None = None
     cmp_mask: np.ndarray | None = None  # bool, length == channel_axis.data length
 
 
-class ChannelMapProcessor(BaseStatefulTransformer[ChannelMapSettings, AxisArray, AxisArray, ChannelMapState]):
+class ChannelMapProcessor(BaseStatefulTransformer[ChannelMapUnitSettings, AxisArray, AxisArray, ChannelMapState]):
     """Stateful transformer that attaches CMP-derived channel metadata.
 
-    The base layer (incoming labels) is rebuilt only when no axis exists yet
-    or when ``n_ch`` changes. CMP entries accumulate into ``cmp_mask``;
-    auto-grid positions are recomputed each reset for the un-masked indices,
-    offset below the CMP geometry to avoid collisions.
-
-    Pushing ``filepath=None`` clears the cumulative overlay (see
-    :meth:`update_settings`).
+    Each reset rebuilds the axis in full from ``settings.cmp_configs``: a base
+    layer from incoming labels, every CMP overlay applied in order, then the
+    auto-grid fills indices no CMP claimed. Reset fires on a channel-count
+    change or any ``cmp_configs`` change (the latter via
+    :class:`BaseProcessor.update_settings` → ``_request_reset``), so there is
+    no cross-push state to coalesce. An empty ``cmp_configs`` yields a pure
+    auto-grid.
     """
-
-    def update_settings(self, new_settings: ChannelMapSettings) -> None:
-        old_filepath = self.settings.filepath
-        super().update_settings(new_settings)
-        # filepath transitioning from set → unset is the explicit "clear" signal.
-        # Drop the cumulative overlay so the next reset rebuilds the base layer
-        # from incoming labels.
-        if old_filepath and not new_settings.filepath:
-            self.state.channel_axis = None
-            self.state.cmp_mask = None
 
     def _reset_state(self, message: AxisArray) -> None:
         ch_dim_idx = message.dims.index("ch")
         n_total = message.data.shape[ch_dim_idx]
 
-        # n_ch changed since the last build → drop cumulative state.
-        if self.state.channel_axis is not None and len(self.state.channel_axis.data) != n_total:
-            self.state.channel_axis = None
-            self.state.cmp_mask = None
+        # Base layer: labels from incoming; positions filled by the overlays
+        # and auto-grid below.
+        ch_data = np.zeros(n_total, dtype=CHANNEL_DTYPE)
+        for i, label in enumerate(self._incoming_labels(message, n_total)):
+            ch_data[i]["label"] = label
+        # Carry through CHANNEL_DTYPE fields other than label (above) and those
+        # the CMP overlays set (below) — e.g. ``device``.
+        incoming = getattr(message.axes.get("ch"), "data", None)
+        if incoming is not None and incoming.dtype.names is not None and "device" in incoming.dtype.names:
+            for i in range(min(n_total, len(incoming))):
+                ch_data[i]["device"] = incoming[i]["device"]
 
-        # Base layer: labels from incoming, positions filled below by auto-grid.
-        if self.state.channel_axis is None:
-            ch_data = np.zeros(n_total, dtype=CHANNEL_DTYPE)
-            for i, label in enumerate(self._incoming_labels(message, n_total)):
-                ch_data[i]["label"] = label
-            # Carry through channel data fields in CHANNEL_DTYPE
-            #  other than label (above) and those in the CMP (below).
-            incoming = getattr(message.axes.get("ch"), "data", None)
-            if incoming is not None and incoming.dtype.names is not None and "device" in incoming.dtype.names:
-                for i in range(min(n_total, len(incoming))):
-                    ch_data[i]["device"] = incoming[i]["device"]
-            self.state.channel_axis = CoordinateAxis(data=ch_data, dims=["ch"], unit="struct")
-            self.state.cmp_mask = np.zeros(n_total, dtype=bool)
-
-        # CMP overlay: write entries at chan_id-1 and mark them in cmp_mask.
-        path = self.settings.filepath
-        if path:
+        # CMP overlays: write each headstage's entries at chan_id-1 and mark
+        # them in cmp_mask so the auto-grid skips them.
+        cmp_mask = np.zeros(n_total, dtype=bool)
+        for cfg in self.settings.cmp_configs:
+            if not cfg.filepath:
+                continue
             try:
-                parsed = parse_cmp(
-                    path,
-                    start_chan=self.settings.start_chan,
-                    hs_id=self.settings.hs_id,
-                )
+                parsed = parse_cmp(cfg.filepath, start_chan=cfg.start_chan, hs_id=cfg.hs_id)
             except Exception as exc:
                 # _reset_state runs on every message via __acall__ until the
                 # hash matches; a re-raise would loop forever. Log and skip.
                 logger.warning(
-                    "ChannelMapProcessor: could not load %r (%s); keeping current channel axis.",
-                    path,
+                    "ChannelMapProcessor: could not load %r (start_chan=%d, hs_id=%d): %s; skipping.",
+                    cfg.filepath,
+                    cfg.start_chan,
+                    cfg.hs_id,
                     exc,
                 )
-                parsed = {}
-            ch_data = self.state.channel_axis.data
+                continue
             for chan_id, entry in parsed.items():
                 idx = chan_id - 1
                 if not (0 <= idx < n_total):
@@ -138,10 +133,13 @@ class ChannelMapProcessor(BaseStatefulTransformer[ChannelMapSettings, AxisArray,
                 ch_data[idx]["label"] = entry.label
                 ch_data[idx]["bank"] = chr(ord("A") + bank_idx - 1)
                 ch_data[idx]["elec"] = elec
-                self.state.cmp_mask[idx] = True
+                cmp_mask[idx] = True
 
-        # Auto-grid: position/bank/elec for indices the CMP didn't claim,
-        # offset below the CMP's geometry so they don't overlap.
+        self.state.channel_axis = CoordinateAxis(data=ch_data, dims=["ch"], unit="struct")
+        self.state.cmp_mask = cmp_mask
+
+        # Auto-grid: position/bank/elec for indices no CMP claimed, offset
+        # below the CMP geometry so they don't overlap.
         self._fill_auto_grid()
 
     def _fill_auto_grid(self) -> None:
@@ -195,5 +193,5 @@ class ChannelMapProcessor(BaseStatefulTransformer[ChannelMapSettings, AxisArray,
         return replace(message, axes={**message.axes, "ch": self.state.channel_axis})
 
 
-class ChannelMapUnit(BaseTransformerUnit[ChannelMapSettings, AxisArray, AxisArray, ChannelMapProcessor]):
-    SETTINGS = ChannelMapSettings
+class ChannelMapUnit(BaseTransformerUnit[ChannelMapUnitSettings, AxisArray, AxisArray, ChannelMapProcessor]):
+    SETTINGS = ChannelMapUnitSettings

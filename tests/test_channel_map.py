@@ -10,6 +10,7 @@ from ezmsg.blackrock.channel_map import (
     CHANNEL_DTYPE,
     ChannelMapProcessor,
     ChannelMapSettings,
+    ChannelMapUnitSettings,
 )
 
 CMP_FILE = str(pathlib.Path(__file__).resolve().parent / "128ChannelDefaultMapping.cmp")
@@ -20,7 +21,8 @@ def _make_processor(
     start_chan: int = 1,
     hs_id: int = 0,
 ) -> ChannelMapProcessor:
-    return ChannelMapProcessor(settings=ChannelMapSettings(filepath=filepath, start_chan=start_chan, hs_id=hs_id))
+    cmp_configs = (ChannelMapSettings(filepath=filepath, start_chan=start_chan, hs_id=hs_id),) if filepath else ()
+    return ChannelMapProcessor(settings=ChannelMapUnitSettings(cmp_configs=cmp_configs))
 
 
 def _make_message(n_channels: int, n_time: int = 5, ch_data: np.ndarray | None = None) -> AxisArray:
@@ -224,16 +226,19 @@ class TestCmpOverlay:
 
 
 class TestStatePreservation:
-    def test_axis_preserved_across_reset_with_same_n_ch(self):
-        """Reset triggered by a setting change keeps the same axis object."""
-        proc = _make_processor(CMP_FILE)
+    def test_settings_change_rebuilds_same_n_ch(self):
+        """A cmp_configs change with unchanged n_ch re-runs the overlay."""
+        proc = _make_processor(CMP_FILE)  # start_chan=1 → indices 0..127
         proc(_make_message(256))
-        base_axis = proc.state.channel_axis
-        # Push a CMP-related setting change (start_chan) — arms a reset, but
-        # n_ch is unchanged so the axis object should be reused in place.
-        proc.update_settings(ChannelMapSettings(filepath=CMP_FILE, start_chan=129))
-        proc(_make_message(256))
-        assert proc.state.channel_axis is base_axis
+        # Move the overlay to the upper half; n_ch unchanged but the config
+        # change arms a reset, so the next message reflects the new placement.
+        proc.update_settings(
+            ChannelMapUnitSettings(cmp_configs=(ChannelMapSettings(filepath=CMP_FILE, start_chan=129),))
+        )
+        out = proc(_make_message(256))
+        data = out.axes["ch"].data
+        assert data[128]["label"] == "chan1"
+        assert data[255]["label"] == "chan128"
 
     def test_n_ch_change_rebuilds_base(self):
         """A different n_ch forces base-layer rebuild on next message."""
@@ -245,29 +250,33 @@ class TestStatePreservation:
         labels_out = proc.state.channel_axis.data["label"]
         assert list(labels_out) == ["b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7"]
 
-    def test_successive_cmps_accumulate(self):
-        """Pushing a second CMP at a disjoint start_chan adds to the existing overlay."""
-        proc = _make_processor(CMP_FILE)  # writes 0..127
-        proc(_make_message(256))
-        # Second push: same CMP, but offset to indices 128..255.
-        proc.update_settings(ChannelMapSettings(filepath=CMP_FILE, start_chan=129))
+    def test_multiple_cmps_overlay(self):
+        """Multiple CMP entries in cmp_configs overlay at their disjoint start_chans."""
+        proc = ChannelMapProcessor(
+            settings=ChannelMapUnitSettings(
+                cmp_configs=(
+                    ChannelMapSettings(filepath=CMP_FILE, start_chan=1),
+                    ChannelMapSettings(filepath=CMP_FILE, start_chan=129),
+                )
+            )
+        )
         out = proc(_make_message(256))
         data = out.axes["ch"].data
-        # Both halves now carry CMP labels.
+        # Both halves carry CMP labels.
         assert data[0]["label"] == "chan1"
         assert data[127]["label"] == "chan128"
         assert data[128]["label"] == "chan1"
         assert data[255]["label"] == "chan128"
 
-    def test_filepath_cleared_rebuilds_base(self):
-        """Pushing filepath=None drops the cumulative overlay and rebuilds the base."""
+    def test_empty_cmp_configs_rebuilds_base(self):
+        """Pushing cmp_configs=() drops the overlay and rebuilds the base."""
         proc = _make_processor(CMP_FILE)
         labels = np.array([f"in{i}" for i in range(256)])
         proc(_make_message(256, ch_data=labels))
         # Sanity: CMP overlay populated indices 0..127.
         assert proc.state.cmp_mask[:128].all()
         # Clear signal.
-        proc.update_settings(ChannelMapSettings(filepath=None))
+        proc.update_settings(ChannelMapUnitSettings(cmp_configs=()))
         out = proc(_make_message(256, ch_data=labels))
         data = out.axes["ch"].data
         # Overlay gone — every label comes from the incoming axis again.

@@ -23,6 +23,7 @@ from .channel_map import (
     ChannelMapProcessor,
     ChannelMapSettings,
     ChannelMapUnit,
+    ChannelMapUnitSettings,
 )
 
 __all__ = [
@@ -41,6 +42,7 @@ __all__ = [
     "ChannelMapProcessor",
     "ChannelMapSettings",
     "ChannelMapUnit",
+    "ChannelMapUnitSettings",
     "DeviceConfig",
     "DeviceStatus",
     "DeviceType",

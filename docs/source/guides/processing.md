@@ -88,6 +88,10 @@ the `ch` axis carries `bank`/`elec` metadata — for example after
 instead, so each channel's delay stays correct even when channels have been
 reordered relative to hardware acquisition.
 
+Set `filter_len` to `0` to disable alignment entirely — the transformer becomes
+a pass-through that returns its input unchanged, handy for A/B comparisons or for
+leaving the unit wired in but inert.
+
 A few things to keep in mind:
 
 - **Latency.** The causal FIR adds a common bulk delay of `(filter_len-1)//2`

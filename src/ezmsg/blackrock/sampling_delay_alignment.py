@@ -99,7 +99,9 @@ class SamplingDelayAlignmentSettings(ez.Settings):
 
     filter_len: int = 33
     """Sinc FIR length (odd). Bulk delay is ``(filter_len-1)//2`` samples; longer
-    = flatter passband / better near Nyquist, at more latency and compute."""
+    = flatter passband / better near Nyquist, at more latency and compute. Set to
+    ``0`` to disable alignment entirely -- the transformer becomes a pass-through
+    that returns its input unchanged."""
 
     rail_threshold: float | None = None
     """If set, samples with ``abs(value) >= rail_threshold`` are treated as
@@ -131,6 +133,16 @@ class SamplingDelayAlignmentTransformer(
 ):
     """Per-channel fractional-delay alignment (see module docstring)."""
 
+    # The rail threshold only gates the forward-fill in _process; it doesn't
+    # alter the designed filters, so changing it needn't reset the state.
+    NONRESET_SETTINGS_FIELDS = frozenset({"rail_threshold"})
+
+    @property
+    def _passthrough(self) -> bool:
+        """``filter_len <= 0`` disables alignment: the transformer returns its
+        input unchanged and skips building the FIR (undefined for ``n_taps`` 0)."""
+        return self.settings.filter_len < 1
+
     def _channel_slots(self, message: AxisArray) -> npt.NDArray:
         """Within-bank A/D sweep position (0-based) for each channel on the
         ``ch`` axis.
@@ -159,6 +171,8 @@ class SamplingDelayAlignmentTransformer(
         return hash((message.key, message.axes["time"].gain, sample_shape, slot.tobytes()))
 
     def _reset_state(self, message: AxisArray) -> None:
+        if self._passthrough:
+            return  # no filters to design; _process returns the input as-is
         time_idx = message.get_axis_idx("time")
         sample_shape = message.data.shape[:time_idx] + message.data.shape[time_idx + 1 :]
         dtype = message.data.dtype
@@ -213,6 +227,8 @@ class SamplingDelayAlignmentTransformer(
         return xp.take_along_axis(x, idx, axis=0)
 
     def _process(self, message: AxisArray) -> AxisArray:
+        if self._passthrough:
+            return message
         ax_idx = message.get_axis_idx("time")
         x = message.data
         xp, is_mlx = _namespace(x)

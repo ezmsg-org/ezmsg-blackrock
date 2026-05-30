@@ -149,6 +149,37 @@ def test_metadata_slot_overrides_acquisition_order():
     assert _car_resid(y_fallback) > 0.2
 
 
+def test_filter_len_zero_is_passthrough():
+    """filter_len=0 disables alignment: the input is returned unchanged (same
+    data, no FIR built, no bulk-delay offset shift)."""
+    proc = sampling_delay_alignment(filter_len=0)
+    x = np.random.default_rng(4).standard_normal((300, 32)).astype(np.float32)
+    out = proc(_aa(x, offset=2.0))
+    np.testing.assert_array_equal(out.data, x)
+    assert out.axes["time"].offset == 2.0  # no bulk-delay shift
+    assert proc.state.fir is None  # _reset_state skipped filter design
+
+
+def test_rail_threshold_is_nonreset():
+    """rail_threshold is in NONRESET_SETTINGS_FIELDS: changing it updates the
+    rail behavior without rebuilding the (expensive) filter state."""
+    proc = sampling_delay_alignment()  # rail_threshold=None
+    x = np.random.default_rng(5).standard_normal((500, 16)).astype(np.float32)
+    proc(_aa(x))  # builds filter state
+    fir_before, hash_before = proc.state.fir, proc._hash
+    assert fir_before is not None
+
+    proc.update_settings(SamplingDelayAlignmentSettings(rail_threshold=8000.0))
+    assert proc._hash == hash_before  # no reset requested
+    assert proc.state.fir is fir_before  # filters not rebuilt
+
+    # ...and the new threshold is honored on the next (same-metadata) chunk.
+    xr = x.copy()
+    xr[100:103, 5] = 1e4
+    out = proc(_aa(xr, offset=500 / FS))
+    assert np.abs(out.data[95:140, 5]).max() < 100.0  # rail held, not rung
+
+
 def test_passthrough_shape_and_dtype():
     proc = sampling_delay_alignment()
     x = np.random.default_rng(3).standard_normal((500, 32)).astype(np.float32)

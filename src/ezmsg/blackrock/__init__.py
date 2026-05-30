@@ -25,6 +25,11 @@ from .channel_map import (
     ChannelMapUnit,
     ChannelMapUnitSettings,
 )
+from .sampling_delay_alignment import (
+    SamplingDelayAlignment,
+    SamplingDelayAlignmentSettings,
+    SamplingDelayAlignmentTransformer,
+)
 
 __all__ = [
     "__version__",
@@ -46,5 +51,8 @@ __all__ = [
     "DeviceConfig",
     "DeviceStatus",
     "DeviceType",
+    "SamplingDelayAlignment",
+    "SamplingDelayAlignmentSettings",
+    "SamplingDelayAlignmentTransformer",
     "SliceConfig",
 ]

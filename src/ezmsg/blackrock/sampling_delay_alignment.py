@@ -16,6 +16,12 @@ that would impose a *different* high-frequency rolloff per channel -- coloring
 the band exactly where the misalignment mattered. There are only ``bank_size``
 distinct delays, so only that many distinct filters.
 
+The within-bank slot defaults to acquisition order (``c % bank_size``). If the
+channel axis carries per-channel ``bank``/``elec`` metadata (e.g. attached by
+:class:`~ezmsg.blackrock.ChannelMapUnit`), the slot is taken from ``elec``
+(``elec - 1``) instead, so each channel's delay is correct even when channels
+are reordered relative to hardware acquisition.
+
 Cost / caveats:
   * **Latency:** the causal FIR has a common bulk delay of ``(filter_len-1)//2``
     samples (the per-channel fractional delays ride on top). The output time
@@ -83,12 +89,10 @@ _DEFAULT_CHANNEL_SAMPLE_INTERVAL = 64.0 / 66.0e6
 class SamplingDelayAlignmentSettings(ez.Settings):
     """Settings for :class:`SamplingDelayAlignmentTransformer`."""
 
-    axis: str = "time"
-    """Time axis to align along. The other (channel) axis is assumed 1-D and in
-    hardware acquisition order."""
-
     bank_size: int = _DEFAULT_BANK_SIZE
-    """Channels per simultaneously-started A/D bank."""
+    """Channels per simultaneously-started A/D bank. Used to derive each
+    channel's sweep slot (``c % bank_size``) only as a fallback, when the channel
+    axis carries no ``bank``/``elec`` metadata."""
 
     channel_sample_interval: float = _DEFAULT_CHANNEL_SAMPLE_INTERVAL
     """Seconds between successive channels within a bank."""
@@ -127,21 +131,42 @@ class SamplingDelayAlignmentTransformer(
 ):
     """Per-channel fractional-delay alignment (see module docstring)."""
 
+    def _channel_slots(self, message: AxisArray) -> npt.NDArray:
+        """Within-bank A/D sweep position (0-based) for each channel on the
+        ``ch`` axis.
+
+        Prefers channel metadata: when the ``ch`` axis carries a structured
+        ``.data`` with ``bank`` and ``elec`` fields (as produced by
+        :class:`~ezmsg.blackrock.ChannelMapUnit`), the slot is ``elec - 1`` --
+        the channel's physical position in its bank's sequential sweep, so the
+        delay is correct even when channels are not in hardware-acquisition
+        order. Falls back to acquisition-order banks of ``bank_size``
+        (``arange(n_ch) % bank_size``) when that metadata is absent.
+        """
+        n_ch = message.data.shape[message.get_axis_idx("ch")]
+        data = getattr(message.axes.get("ch"), "data", None)
+        names = getattr(getattr(data, "dtype", None), "names", None)
+        if names is not None and "bank" in names and "elec" in names and len(data) == n_ch:
+            return data["elec"].astype(np.int64) - 1
+        return np.arange(n_ch) % self.settings.bank_size
+
     def _hash_message(self, message: AxisArray) -> int:
-        ax_idx = message.get_axis_idx(self.settings.axis)
-        sample_shape = message.data.shape[:ax_idx] + message.data.shape[ax_idx + 1 :]
-        return hash((message.key, message.axes[self.settings.axis].gain, sample_shape))
+        time_idx = message.get_axis_idx("time")
+        sample_shape = message.data.shape[:time_idx] + message.data.shape[time_idx + 1 :]
+        # Include the slot layout so a metadata change (e.g. a new channel map)
+        # re-designs the filters even when shape/key/gain are unchanged.
+        slot = self._channel_slots(message)
+        return hash((message.key, message.axes["time"].gain, sample_shape, slot.tobytes()))
 
     def _reset_state(self, message: AxisArray) -> None:
-        ax_idx = message.get_axis_idx(self.settings.axis)
-        sample_shape = message.data.shape[:ax_idx] + message.data.shape[ax_idx + 1 :]
+        time_idx = message.get_axis_idx("time")
+        sample_shape = message.data.shape[:time_idx] + message.data.shape[time_idx + 1 :]
         dtype = message.data.dtype
         xp, is_mlx = _namespace(message.data)
-        fs = 1.0 / message.axes[self.settings.axis].gain
+        fs = 1.0 / message.axes["time"].gain
 
-        n_ch = int(np.prod(sample_shape, dtype=int))
-        slot = np.arange(n_ch) % self.settings.bank_size
-        # Fractional-sample delay that brings channel c back to the bank start.
+        slot = self._channel_slots(message)
+        # Fractional-sample delay that brings each channel back to its bank start.
         d = slot * self.settings.channel_sample_interval * fs  # in [0, ~0.9]
 
         n_taps = int(self.settings.filter_len)
@@ -188,7 +213,7 @@ class SamplingDelayAlignmentTransformer(
         return xp.take_along_axis(x, idx, axis=0)
 
     def _process(self, message: AxisArray) -> AxisArray:
-        ax_idx = message.get_axis_idx(self.settings.axis)
+        ax_idx = message.get_axis_idx("time")
         x = message.data
         xp, is_mlx = _namespace(x)
         moved = ax_idx != 0
@@ -216,12 +241,12 @@ class SamplingDelayAlignmentTransformer(
 
         # Output sample i carries the bank-start signal delayed by bulk_delay
         # samples; shift the time-axis offset so timestamps stay physical.
-        axis = self.settings.axis
+        time_axis = message.axes["time"]
         new_axis = replace(
-            message.axes[axis],
-            offset=message.axes[axis].offset - st.bulk_delay * message.axes[axis].gain,
+            time_axis,
+            offset=time_axis.offset - st.bulk_delay * time_axis.gain,
         )
-        return replace(message, data=y, axes={**message.axes, axis: new_axis})
+        return replace(message, data=y, axes={**message.axes, "time": new_axis})
 
 
 class SamplingDelayAlignment(

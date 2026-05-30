@@ -82,6 +82,12 @@ linear interpolation is a delay-dependent low-pass that would impose a
 *different* high-frequency rolloff per channel — coloring the band exactly where
 the misalignment mattered.
 
+The per-channel delay defaults to acquisition order (slot `c % bank_size`). If
+the `ch` axis carries `bank`/`elec` metadata — for example after
+{class}`~ezmsg.blackrock.ChannelMapUnit` has run — the slot is taken from `elec`
+instead, so each channel's delay stays correct even when channels have been
+reordered relative to hardware acquisition.
+
 A few things to keep in mind:
 
 - **Latency.** The causal FIR adds a common bulk delay of `(filter_len-1)//2`

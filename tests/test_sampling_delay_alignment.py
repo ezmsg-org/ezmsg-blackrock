@@ -15,15 +15,20 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from ezmsg.util.messages.axisarray import AxisArray, LinearAxis
+from ezmsg.util.messages.axisarray import AxisArray, CoordinateAxis, LinearAxis
 
 from ezmsg.blackrock.sampling_delay_alignment import (
-    sampling_delay_alignment,
+    SamplingDelayAlignmentSettings,
+    SamplingDelayAlignmentTransformer,
 )
 
 FS = 30000.0
 BANK = 32
 INTERVAL = 64.0 / 66.0e6
+
+
+def sampling_delay_alignment(**kwargs) -> SamplingDelayAlignmentTransformer:
+    return SamplingDelayAlignmentTransformer(settings=SamplingDelayAlignmentSettings(**kwargs))
 
 
 def _aa(data: np.ndarray, offset: float = 0.0) -> AxisArray:
@@ -103,6 +108,45 @@ def test_output_offset_accounts_for_bulk_delay():
     out = proc(_aa(x, offset=5.0))
     m = (filter_len - 1) // 2
     assert out.axes["time"].offset == pytest.approx(5.0 - m / FS)
+
+
+def _car_resid(d: np.ndarray, seg: slice = slice(64, -64)) -> float:
+    r = d - d.mean(axis=1, keepdims=True)
+    return float(np.sqrt(np.mean(r[seg] ** 2)) / np.sqrt(np.mean(d[seg] ** 2)))
+
+
+def test_metadata_slot_overrides_acquisition_order():
+    """When the ch axis carries bank/elec metadata, the sweep slot is taken from
+    elec, so alignment works even with channels shuffled out of hardware order --
+    where the bank_size fallback (slot = c % bank_size) mis-aligns them."""
+    f, n, nch = 5000.0, 10000, 64
+    t = np.arange(n) / FS
+    # A shuffled layout: array position i is some physical (bank, elec), so
+    # i % BANK does NOT equal the true within-bank slot (elec - 1).
+    perm = np.random.default_rng(7).permutation(nch)
+    elec = (perm % BANK) + 1
+    bank = np.array([chr(ord("A") + b) for b in (perm // BANK)])
+    tau = (elec - 1) * INTERVAL  # true per-channel sampling delay
+    x = np.cos(2 * np.pi * f * (t[:, None] + tau[None, :])).astype(np.float32)
+
+    ch_data = np.zeros(nch, dtype=np.dtype([("bank", "U1"), ("elec", "i4")]))
+    ch_data["bank"] = bank
+    ch_data["elec"] = elec
+    ch_axis = CoordinateAxis(data=ch_data, dims=["ch"], unit="struct")
+    msg = AxisArray(
+        data=x,
+        dims=["time", "ch"],
+        axes={"time": LinearAxis(offset=0.0, gain=1.0 / FS), "ch": ch_axis},
+        key="align",
+    )
+
+    # Metadata-driven slots collapse the misaligned common mode...
+    y_meta = sampling_delay_alignment()(msg).data
+    assert _car_resid(y_meta) < 0.01
+    # ...whereas the bank_size fallback (no metadata) can't, because the shuffled
+    # channel order doesn't match c % bank_size.
+    y_fallback = sampling_delay_alignment()(_aa(x)).data
+    assert _car_resid(y_fallback) > 0.2
 
 
 def test_passthrough_shape_and_dtype():

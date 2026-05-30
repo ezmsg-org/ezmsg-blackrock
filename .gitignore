@@ -162,3 +162,4 @@ cython_debug/
 src/ezmsg/blackrock/__version__.py
 tests/.test_cache/
 uv.lock
+docs/source/api/generated

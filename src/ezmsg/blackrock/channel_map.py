@@ -1,7 +1,9 @@
 """Attach Blackrock ``.cmp`` channel-map metadata to an ``AxisArray``'s ``ch`` axis.
 
 The output ``ch`` axis is a structured ``CoordinateAxis`` with fields
-``x``, ``y``, ``label``, ``bank``, ``elec`` for every input channel.
+``x``, ``y``, ``size``, ``label``, ``bank``, ``elec``, ``headstage`` for every
+input channel. ``x``/``y``/``size`` are in micrometers; ``headstage`` is the
+1-based headstage id (``0`` = none/auto).
 
 :class:`ChannelMapUnit` takes the *complete* set of per-headstage overlays in
 one settings object (:class:`ChannelMapUnitSettings`, a tuple of
@@ -14,13 +16,18 @@ Each reset proceeds in three phases:
 
 1. **Base layer** — labels are pulled from the incoming ``ch`` axis.
 2. **CMP overlays** — for each :class:`ChannelMapSettings` in ``cmp_configs``,
-   entries from :func:`pycbsdk.cmp.parse_cmp` are written at indices
-   ``chan_id - 1`` (with ``chan_id`` offset by ``start_chan``). A companion
-   ``cmp_mask`` records which indices were set so the auto-grid pass can avoid
-   them.
+   entries from :func:`pycbsdk.cmp.parse_cmp` are written at their channel
+   index. ``parse_cmp`` (CerebusOSS/CereLink#184) returns entries keyed by
+   device ``(bank, term)`` with flat ``x``/``y``/``size``/``headstage`` fields
+   (``x``/``y`` in micrometers) and verbatim labels; the channel index is
+   ``(bank - 1) * 32 + (term - 1)`` — ``start_chan`` is already folded into
+   ``bank`` via its ``// 32`` offset. A companion ``cmp_mask`` records which
+   indices were set so the auto-grid pass can avoid them.
 3. **Auto-grid fill** — positions/bank/elec for indices NOT covered by any
    CMP, laid out below and to the right of the CMP geometry so they don't
-   collide with CMP positions.
+   collide with CMP positions. The grid step matches the CMP's electrode
+   pitch (inferred from its coordinates), so auto-laid channels share the
+   CMP's micrometer scale.
 
 The same :class:`ChannelMapSettings` record is also used as a per-headstage
 entry in :attr:`CereLinkSignalSettings.cmp_configs`.
@@ -40,12 +47,13 @@ logger = logging.getLogger(__name__)
 
 CHANNEL_DTYPE = np.dtype(
     [
-        ("x", "f4"),
-        ("y", "f4"),
+        ("x", "i4"),  # electrode x, µm (int32, matching cbPKT_CHANINFO.position)
+        ("y", "i4"),  # electrode y, µm
+        ("size", "i4"),  # electrode size, µm (0 = unspecified)
         ("label", "U16"),
         ("bank", "U1"),
         ("elec", "i4"),
-        ("device", "U16"),
+        ("headstage", "i4"),  # 1-based headstage id (0 = none/auto)
     ]
 )
 
@@ -60,8 +68,10 @@ class ChannelMapSettings(ez.Settings):
     Mirrors :meth:`pycbsdk.Session.load_channel_map`."""
 
     hs_id: int = 0
-    """Headstage identifier; labels are prefixed ``"hs{hs_id}-"`` when nonzero.
-    Pass ``0`` (the default) to leave labels un-prefixed."""
+    """Headstage identifier, passed through to :func:`pycbsdk.cmp.parse_cmp`,
+    where it sets each entry's ``headstage`` field. Labels are taken verbatim
+    (no ``"hs{hs_id}-"`` prefix); ``bank``/``elec`` disambiguate channels that
+    reuse a label across headstages. Pass ``0`` for single-headstage rigs."""
 
 
 class ChannelMapUnitSettings(ez.Settings):
@@ -97,12 +107,6 @@ class ChannelMapProcessor(BaseStatefulTransformer[ChannelMapUnitSettings, AxisAr
         ch_data = np.zeros(n_total, dtype=CHANNEL_DTYPE)
         for i, label in enumerate(self._incoming_labels(message, n_total)):
             ch_data[i]["label"] = label
-        # Carry through CHANNEL_DTYPE fields other than label (above) and those
-        # the CMP overlays set (below) — e.g. ``device``.
-        incoming = getattr(message.axes.get("ch"), "data", None)
-        if incoming is not None and incoming.dtype.names is not None and "device" in incoming.dtype.names:
-            for i in range(min(n_total, len(incoming))):
-                ch_data[i]["device"] = incoming[i]["device"]
 
         # CMP overlays: write each headstage's entries at chan_id-1 and mark
         # them in cmp_mask so the auto-grid skips them.
@@ -123,16 +127,20 @@ class ChannelMapProcessor(BaseStatefulTransformer[ChannelMapUnitSettings, AxisAr
                     exc,
                 )
                 continue
-            for chan_id, entry in parsed.items():
-                idx = chan_id - 1
+            for (bank, term), entry in parsed.items():
+                # parse_cmp keys by device (bank, term); start_chan is already
+                # folded into bank via its // 32 offset, so the channel index is
+                # a direct (bank, term) → row mapping (32 terminals per bank).
+                idx = (bank - 1) * 32 + (term - 1)
                 if not (0 <= idx < n_total):
                     continue
-                col, row, bank_idx, elec = entry.position
-                ch_data[idx]["x"] = float(col)
-                ch_data[idx]["y"] = float(row)
-                ch_data[idx]["label"] = entry.label
-                ch_data[idx]["bank"] = chr(ord("A") + bank_idx - 1)
-                ch_data[idx]["elec"] = elec
+                ch_data[idx]["x"] = int(entry.x)
+                ch_data[idx]["y"] = int(entry.y)
+                ch_data[idx]["size"] = int(entry.size)
+                ch_data[idx]["label"] = entry.label  # verbatim (no hs{N}- prefix)
+                ch_data[idx]["bank"] = chr(ord("A") + bank - 1)
+                ch_data[idx]["elec"] = term
+                ch_data[idx]["headstage"] = entry.headstage
                 cmp_mask[idx] = True
 
         self.state.channel_axis = CoordinateAxis(data=ch_data, dims=["ch"], unit="struct")
@@ -149,27 +157,52 @@ class ChannelMapProcessor(BaseStatefulTransformer[ChannelMapUnitSettings, AxisAr
         if auto_idx.size == 0:
             return
 
+        # Step matches the CMP's electrode pitch (≈400 µm) so the auto-grid
+        # sits on the same scale as the CMP geometry. Without this, the µm CMP
+        # coordinates would dwarf a unit-spaced auto-grid. Falls back to 1
+        # when there is no CMP (pure auto-grid from the origin).
+        step = self._cmp_pitch(ch_data, cmp_mask)
+
         if cmp_mask.any():
-            max_row = float(ch_data["y"][cmp_mask].max())
+            max_row = int(ch_data["y"][cmp_mask].max())
             max_bank_ord = max(
                 (ord(str(b)) for b in ch_data["bank"][cmp_mask] if str(b)),
                 default=ord("A") - 1,
             )
         else:
             # No CMP yet — start auto-grid at the origin with bank A.
-            # max_row = -2 makes start_row = 0 below.
-            max_row = -2.0
+            # max_row = -2*step makes start_row = 0 below.
+            max_row = -2 * step
             max_bank_ord = ord("A") - 1
 
-        start_row = max_row + 2
+        start_row = max_row + 2 * step
         next_bank_ord = max_bank_ord + 1
         grid_size = max(1, math.ceil(math.sqrt(auto_idx.size)))
 
         for i, idx in enumerate(auto_idx):
-            ch_data[idx]["x"] = float(i % grid_size)
-            ch_data[idx]["y"] = float(start_row + i // grid_size)
+            ch_data[idx]["x"] = (i % grid_size) * step
+            ch_data[idx]["y"] = start_row + (i // grid_size) * step
+            ch_data[idx]["size"] = step  # synthetic electrodes sized to the grid pitch
             ch_data[idx]["bank"] = chr(next_bank_ord + i // 32)
             ch_data[idx]["elec"] = (i % 32) + 1
+            ch_data[idx]["headstage"] = 0  # auto-grid channels have no headstage
+
+    @staticmethod
+    def _cmp_pitch(ch_data: np.ndarray, cmp_mask: np.ndarray) -> int:
+        """Smallest positive spacing among the CMP's distinct x/y coordinates.
+
+        This is the electrode pitch in micrometers (≈400 for a default Utah
+        array). Defaults to ``1`` when there is no CMP or the geometry is
+        degenerate, giving the pure auto-grid unit spacing from the origin."""
+        if not cmp_mask.any():
+            return 1
+        deltas: list[int] = []
+        for field in ("x", "y"):
+            vals = np.unique(ch_data[field][cmp_mask])
+            if vals.size > 1:
+                deltas.append(int(np.diff(vals).min()))
+        positive = [d for d in deltas if d > 0]
+        return min(positive) if positive else 1
 
     @staticmethod
     def _incoming_labels(message: AxisArray, n_total: int) -> list[str]:

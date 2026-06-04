@@ -15,7 +15,7 @@ from ezmsg.baseproc import processor_state
 from ezmsg.baseproc.stateful import BaseStatefulProducer
 from ezmsg.baseproc.units import BaseProducerUnit
 from ezmsg.util.messages.axisarray import AxisArray, replace
-from pycbsdk import ChannelType, DeviceType, SampleRate, Session
+from pycbsdk import ChanInfoField, ChannelType, DeviceType, SampleRate, Session
 
 from .channel_map import CHANNEL_DTYPE, ChannelMapSettings
 
@@ -170,7 +170,7 @@ class _CereLinkSharedState:
     """State fields common to signal and spike producers."""
 
     session: Session | None = None
-    ch_positions: dict | None = None  # ch_id -> (col, row, bank, elec)
+    ch_positions: dict | None = None  # ch_id -> (x, y, size, headstage, bank_num, term)
 
 
 @processor_state
@@ -311,9 +311,19 @@ class _CereLinkBaseProducer(
                 self.state.session.load_channel_map(cmp_cfg.filepath, cmp_cfg.start_chan, cmp_cfg.hs_id)
 
     def _cache_channel_metadata(self) -> None:
-        all_ids = self.state.session.get_matching_channel_ids(ChannelType.FRONTEND)
-        all_pos = self.state.session.get_channels_positions(ChannelType.FRONTEND)
-        self.state.ch_positions = dict(zip(all_ids, all_pos))
+        # ``position[]`` carries ``(x, y, size, headstage_id)`` since CereLink
+        # #184 (CerebusOSS/CereLink#184); ``bank``/``term`` come from chaninfo
+        # (``ChanInfoField``) rather than position, where they were previously
+        # encoded. ``x``/``y``/``size`` are in micrometers.
+        sess = self.state.session
+        all_ids = sess.get_matching_channel_ids(ChannelType.FRONTEND)
+        all_pos = sess.get_channels_positions(ChannelType.FRONTEND)
+        banks = sess.get_channels_field(ChannelType.FRONTEND, ChanInfoField.BANK)
+        terms = sess.get_channels_field(ChannelType.FRONTEND, ChanInfoField.TERM)
+        self.state.ch_positions = {
+            cid: (pos[0], pos[1], pos[2], pos[3], bank, term)
+            for cid, pos, bank, term in zip(all_ids, all_pos, banks, terms)
+        }
 
     def _build_ch_info(self, channels: list[int]) -> np.ndarray:
         n_ch = len(channels)
@@ -321,11 +331,13 @@ class _CereLinkBaseProducer(
         for i, ch_id in enumerate(channels):
             label = self.state.session.get_channel_label(ch_id)
             ch_info[i]["label"] = label or f"ch{ch_id}"
-            pos = self.state.ch_positions.get(ch_id, (0, 0, 0, 0))
-            ch_info[i]["x"] = pos[0]
-            ch_info[i]["y"] = pos[1]
-            ch_info[i]["bank"] = chr(ord("A") + pos[2] - 1) if pos[2] > 0 else ""
-            ch_info[i]["elec"] = pos[3]
+            x, y, size, headstage, bank_num, term = self.state.ch_positions.get(ch_id, (0, 0, 0, 0, 0, 0))
+            ch_info[i]["x"] = x
+            ch_info[i]["y"] = y
+            ch_info[i]["size"] = size
+            ch_info[i]["bank"] = chr(ord("A") + bank_num - 1) if bank_num > 0 else ""
+            ch_info[i]["elec"] = term
+            ch_info[i]["headstage"] = headstage
         return ch_info
 
     def _device_name(self) -> str:

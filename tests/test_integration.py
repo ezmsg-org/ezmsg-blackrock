@@ -115,16 +115,16 @@ class TestCereLinkSignalSource:
         ), f"non-monotonic at (idx, prev, next): {violations}; offsets[0]={offsets[0]}, offsets[-1]={offsets[-1]}"
 
     def test_all_channels(self, nplayserver, tmp_path):
-        """`SliceConfig(channels=None)` configures all matching FRONTEND channels.
-        NPLAY emulates the full NSP channel layout (256 FRONTEND), so even
-        with a 4-channel recording the AxisArray has 256 columns — the
-        unrecorded channels carry zeros but are still configured."""
+        """Default `SliceConfig` (channels=ChannelSelection.ALL) configures all
+        matching FRONTEND channels. NPLAY emulates the full NSP channel layout
+        (256 FRONTEND), so even with a 4-channel recording the AxisArray has 256
+        columns — the unrecorded channels carry zeros but are still configured."""
         expected_n_ch = 256  # NPLAY's nominal FRONTEND count
         messages = _run_signal_source(
             CereLinkSignalSettings(
                 device_type=DeviceType.NPLAY,
                 subscribe_rate=SampleRate.SR_30kHz,
-                configure=SliceConfig(channel_type=ChannelType.FRONTEND),  # channels=None => all
+                configure=SliceConfig(channel_type=ChannelType.FRONTEND),  # default ALL
                 microvolts=False,
                 cbtime=True,
             ),

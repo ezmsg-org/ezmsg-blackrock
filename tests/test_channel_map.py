@@ -338,3 +338,103 @@ class TestAutoGridPlacement:
         assert data[0]["y"] >= 3600.0
         # And uses banks past CMP's max (H) → starts at I.
         assert data[0]["bank"] == "I"
+
+
+# ---------------------------------------------------------------------------
+# Source-provided geometry (no CMP file needed)
+# ---------------------------------------------------------------------------
+
+
+def _make_message_passthrough(n_channels: int, positions: np.ndarray, n_time: int = 5) -> AxisArray:
+    """Build a message whose ``ch`` axis already carries CHANNEL_DTYPE geometry,
+    mimicking a CereLink source that read positions from device chaninfo.
+
+    ``positions`` is an ``(n_channels, 2)`` array of (x, y) in micrometers.
+    """
+    ch_data = np.zeros(n_channels, dtype=CHANNEL_DTYPE)
+    for i in range(n_channels):
+        ch_data[i]["x"] = positions[i, 0]
+        ch_data[i]["y"] = positions[i, 1]
+        ch_data[i]["size"] = 400
+        ch_data[i]["label"] = f"src{i}"
+        ch_data[i]["bank"] = chr(ord("A") + i // 32)
+        ch_data[i]["elec"] = (i % 32) + 1
+        ch_data[i]["headstage"] = 1
+    return AxisArray(
+        data=np.zeros((n_time, n_channels)),
+        dims=["time", "ch"],
+        axes={
+            "time": LinearAxis(offset=0.0, gain=0.001),
+            "ch": CoordinateAxis(data=ch_data, dims=["ch"]),
+        },
+    )
+
+
+class TestSourceGeometry:
+    def test_source_positions_preserved_without_cmp(self):
+        """Structured x/y/size/bank/elec/headstage from the source flow through
+        verbatim when no CMP file is configured."""
+        pos = np.column_stack([(np.arange(64) % 8) * 400, (np.arange(64) // 8) * 400])
+        proc = _make_processor(None)  # empty cmp_configs
+        out = proc(_make_message_passthrough(64, pos))
+        data = out.axes["ch"].data
+        np.testing.assert_array_equal(data["x"], pos[:, 0])
+        np.testing.assert_array_equal(data["y"], pos[:, 1])
+        assert data[0]["label"] == "src0"
+        assert data[0]["size"] == 400
+        assert data[0]["headstage"] == 1
+        # Every channel is source-placed → nothing auto-gridded.
+        assert proc.state.src_mask.all()
+        assert not proc.state.cmp_mask.any()
+
+    def test_cmp_overrides_source_positions(self):
+        """A CMP overlay wins over source geometry at the indices it claims."""
+        pos = np.column_stack([(np.arange(128) % 16) * 999, (np.arange(128) // 16) * 999])
+        proc = _make_processor(CMP_FILE)  # start_chan=1 → indices 0..127
+        out = proc(_make_message_passthrough(128, pos))
+        data = out.axes["ch"].data
+        # CMP labels/coords replaced the source ones.
+        assert data[0]["label"] == "chan1"
+        assert data[0]["x"] == 0
+        assert data[127]["label"] == "chan128"
+        assert proc.state.cmp_mask.all()
+        # src_mask cleared where the CMP took over.
+        assert not (proc.state.src_mask & proc.state.cmp_mask).any()
+
+    def test_unmapped_origin_pileup_falls_through_to_auto_grid(self):
+        """The first (0, 0) channel is kept; later origin channels (the device's
+        'unmapped' sentinel) are auto-gridded below the real geometry."""
+        pos = np.array([[0, 0], [400, 0], [0, 0], [0, 0]])
+        proc = _make_processor(None)
+        out = proc(_make_message_passthrough(4, pos))
+        data = out.axes["ch"].data
+        # ch0: lone-kept origin electrode; ch1: real position.
+        assert (data[0]["x"], data[0]["y"]) == (0, 0)
+        assert (data[1]["x"], data[1]["y"]) == (400, 0)
+        assert proc.state.src_mask[0] and proc.state.src_mask[1]
+        # ch2/ch3: duplicate origins → auto-gridded, not left stacked at (0,0).
+        assert not proc.state.src_mask[2]
+        assert not proc.state.src_mask[3]
+        auto_y = min(int(data[2]["y"]), int(data[3]["y"]))
+        assert auto_y >= int(data["y"][proc.state.src_mask].max()) + 2 * 400
+
+    def test_auto_grid_sits_below_source_geometry(self):
+        """With a partial source map, the auto-grid offsets below the source's
+        max y, same as it does below CMP geometry."""
+        # 4 source-placed channels on a 400 µm grid; 4 unmapped origin dupes.
+        pos = np.array([[0, 0], [400, 0], [0, 400], [400, 400], [0, 0], [0, 0], [0, 0], [0, 0]])
+        proc = _make_processor(None)
+        out = proc(_make_message_passthrough(8, pos))
+        data = out.axes["ch"].data
+        src_y_max = int(data["y"][proc.state.src_mask].max())
+        auto_y_min = int(data["y"][~proc.state.src_mask].min())
+        assert auto_y_min >= src_y_max + 800
+
+    def test_unstructured_incoming_still_auto_grids_from_origin(self):
+        """Label-only / plain incoming axes keep the original pure auto-grid."""
+        proc = _make_processor(None)
+        out = proc(_make_message(64))  # ch_data = np.arange(64), unstructured
+        data = out.axes["ch"].data
+        assert data[0]["x"] == 0
+        assert data[0]["y"] == 0
+        assert not proc.state.src_mask.any()

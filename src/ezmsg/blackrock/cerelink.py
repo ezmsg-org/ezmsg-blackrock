@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import logging
 import threading
 import time
@@ -15,7 +16,7 @@ from ezmsg.baseproc import processor_state
 from ezmsg.baseproc.stateful import BaseStatefulProducer
 from ezmsg.baseproc.units import BaseProducerUnit
 from ezmsg.util.messages.axisarray import AxisArray, replace
-from pycbsdk import ChannelType, DeviceType, SampleRate, Session
+from pycbsdk import ChanInfoField, ChannelType, DeviceType, SampleRate, Session
 
 from .channel_map import CHANNEL_DTYPE, ChannelMapSettings
 
@@ -55,6 +56,22 @@ class CcfConfig:
     path: str
 
 
+class ChannelSelection(enum.Enum):
+    """Sentinel selections for :attr:`SliceConfig.channels` (the cases an
+    explicit channel-ID list can't express)."""
+
+    ALL = "all"
+    """Every channel matching ``channel_type``; the others are disabled."""
+
+    ENABLED = "enabled"
+    """Only the channels the device **already** has enabled for this stream; the
+    enabled set is left unchanged. What counts as "enabled" is stream-specific:
+    continuous sample-group membership for the signal source (channels are
+    retuned to its rate/coupling but never enabled/disabled), and spike-extraction
+    state for the spike source (extraction is left exactly as-is, and the source
+    subscribes to whatever already has it on)."""
+
+
 @dataclass
 class SliceConfig:
     """Programmatic per-slice device configuration owned by this source.
@@ -68,8 +85,21 @@ class SliceConfig:
     responsibility.
     """
 
-    channels: list[int] | None = None
-    """1-based channel IDs to configure. ``None`` = all matching ``channel_type``."""
+    channels: list[int] | ChannelSelection = ChannelSelection.ALL
+    """Which channels this slice targets — one field, three intents:
+
+    - ``list[int]`` — enable exactly these 1-based channel IDs; the other
+      channels of ``channel_type`` are disabled. A provided list is always
+      respected.
+    - :attr:`ChannelSelection.ALL` (default) — enable every channel matching
+      ``channel_type``; others disabled.
+    - :attr:`ChannelSelection.ENABLED` — leave the device's enabled set as-is and
+      only consume it. Signal source: retune the already-streaming channels
+      (``disable_others=False``, so an unused front-end bank stays off). Spike
+      source: leave spike extraction untouched and subscribe to whatever already
+      has it on (``enable_spiking`` is ignored in this mode). An empty enabled
+      set yields nothing and warns.
+    """
 
     channel_type: ChannelType = ChannelType.FRONTEND
 
@@ -79,8 +109,18 @@ class SliceConfig:
     """
 
     enable_spiking: bool = False
-    """Enable spike extraction on this slice (FRONTEND only). Honored by
-    :class:`CereLinkSpikeSource`; ignored by signal sources."""
+    """Enable spike extraction on the selected channels (FRONTEND only). Honored
+    by :class:`CereLinkSpikeSource`; ignored by signal sources, and ignored when
+    ``channels`` is :attr:`ChannelSelection.ENABLED` (which leaves extraction
+    exactly as the device has it)."""
+
+    def __post_init__(self):
+        if not isinstance(self.channels, (list, ChannelSelection)):
+            raise TypeError(
+                "SliceConfig.channels must be a list of 1-based channel IDs or a "
+                f"ChannelSelection member, not {type(self.channels).__name__}. "
+                "Did you mean ChannelSelection.ALL or ChannelSelection.ENABLED?"
+            )
 
 
 DeviceConfig = CcfConfig | SliceConfig | None
@@ -170,7 +210,7 @@ class _CereLinkSharedState:
     """State fields common to signal and spike producers."""
 
     session: Session | None = None
-    ch_positions: dict | None = None  # ch_id -> (col, row, bank, elec)
+    ch_positions: dict | None = None  # ch_id -> (x, y, size, headstage, bank_num, term)
 
 
 @processor_state
@@ -305,15 +345,59 @@ class _CereLinkBaseProducer(
         """Subclass hook: stream-specific slice config (sample-group OR spike-extract)."""
         raise NotImplementedError
 
+    def _enabled_channels(self, channel_type: ChannelType) -> list[int]:
+        """1-based IDs of *channel_type* channels the device already has enabled
+        for this stream — the set :attr:`ChannelSelection.ENABLED` resolves to.
+
+        Base implementation (the signal-stream meaning): channels currently in a
+        continuous sample group, i.e. already streaming. The per-channel
+        ``SMPGROUP`` field reads 0 for raw-group channels, so we union the
+        membership of every continuous group (``SampleRate`` 1..6) rather than
+        trust that field, then intersect with the type filter. The spike producer
+        overrides this with its own meaning (spike-extraction state). Call after a
+        :meth:`sync` so the device state is fresh.
+        """
+        sess = self.state.session
+        enabled: set[int] = set()
+        for sr in SampleRate:
+            if sr == SampleRate.NONE:
+                continue
+            enabled.update(sess.get_group_channels(int(sr)))
+        matching = set(sess.get_matching_channel_ids(channel_type))
+        return sorted(enabled & matching)
+
+    def _resolve_channels(self, cfg: SliceConfig) -> list[int]:
+        """Concrete 1-based channel IDs this slice targets, resolving the
+        :attr:`SliceConfig.channels` selection against the device's current
+        state (see :class:`ChannelSelection`). ``ENABLED`` :meth:`sync`\\ s first
+        so the group membership is fresh."""
+        sess = self.state.session
+        if cfg.channels is ChannelSelection.ALL:
+            return list(sess.get_matching_channel_ids(cfg.channel_type))
+        if cfg.channels is ChannelSelection.ENABLED:
+            sess.sync()
+            return self._enabled_channels(cfg.channel_type)
+        return list(cfg.channels)
+
     def _apply_channel_maps(self) -> None:
         for cmp_cfg in self.settings.cmp_configs:
             if cmp_cfg.filepath:
                 self.state.session.load_channel_map(cmp_cfg.filepath, cmp_cfg.start_chan, cmp_cfg.hs_id)
 
     def _cache_channel_metadata(self) -> None:
-        all_ids = self.state.session.get_matching_channel_ids(ChannelType.FRONTEND)
-        all_pos = self.state.session.get_channels_positions(ChannelType.FRONTEND)
-        self.state.ch_positions = dict(zip(all_ids, all_pos))
+        # ``position[]`` carries ``(x, y, size, headstage_id)`` since CereLink
+        # #184 (CerebusOSS/CereLink#184); ``bank``/``term`` come from chaninfo
+        # (``ChanInfoField``) rather than position, where they were previously
+        # encoded. ``x``/``y``/``size`` are in micrometers.
+        sess = self.state.session
+        all_ids = sess.get_matching_channel_ids(ChannelType.FRONTEND)
+        all_pos = sess.get_channels_positions(ChannelType.FRONTEND)
+        banks = sess.get_channels_field(ChannelType.FRONTEND, ChanInfoField.BANK)
+        terms = sess.get_channels_field(ChannelType.FRONTEND, ChanInfoField.TERM)
+        self.state.ch_positions = {
+            cid: (pos[0], pos[1], pos[2], pos[3], bank, term)
+            for cid, pos, bank, term in zip(all_ids, all_pos, banks, terms)
+        }
 
     def _build_ch_info(self, channels: list[int]) -> np.ndarray:
         n_ch = len(channels)
@@ -321,11 +405,13 @@ class _CereLinkBaseProducer(
         for i, ch_id in enumerate(channels):
             label = self.state.session.get_channel_label(ch_id)
             ch_info[i]["label"] = label or f"ch{ch_id}"
-            pos = self.state.ch_positions.get(ch_id, (0, 0, 0, 0))
-            ch_info[i]["x"] = pos[0]
-            ch_info[i]["y"] = pos[1]
-            ch_info[i]["bank"] = chr(ord("A") + pos[2] - 1) if pos[2] > 0 else ""
-            ch_info[i]["elec"] = pos[3]
+            x, y, size, headstage, bank_num, term = self.state.ch_positions.get(ch_id, (0, 0, 0, 0, 0, 0))
+            ch_info[i]["x"] = x
+            ch_info[i]["y"] = y
+            ch_info[i]["size"] = size
+            ch_info[i]["bank"] = chr(ord("A") + bank_num - 1) if bank_num > 0 else ""
+            ch_info[i]["elec"] = term
+            ch_info[i]["headstage"] = headstage
         return ch_info
 
     def _device_name(self) -> str:
@@ -378,10 +464,28 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
     """Streams one continuous sample-group as :class:`AxisArray`."""
 
     def _apply_slice_configure(self, cfg: SliceConfig) -> None:
+        sess = self.state.session
+        if sess is None:
+            return
         rate = self.settings.subscribe_rate
-        if self.state.session is not None:
-            self.state.session.set_sample_group(cfg.channels, cfg.channel_type, rate, disable_others=True)
-            self.state.session.set_ac_input_coupling(cfg.channels, cfg.channel_type, cfg.ac_input_coupling)
+        channels = self._resolve_channels(cfg)
+        if cfg.channels is ChannelSelection.ENABLED:
+            # Retune only the channels the device already streams; never enable
+            # or disable one (disable_others=False), so an unused bank stays off.
+            if not channels:
+                logger.warning(
+                    "CereLink: channels=ChannelSelection.ENABLED but no %s channels are "
+                    "currently enabled on the device; nothing will stream. Enable channels "
+                    "upstream, or use channels=ChannelSelection.ALL to configure all of them.",
+                    cfg.channel_type.name,
+                )
+            disable_others = False
+        else:
+            # Explicit list or ALL: the resolved set is authoritative; everything
+            # else of this channel_type is disabled.
+            disable_others = True
+        sess.set_sample_group(channels, cfg.channel_type, rate, disable_others=disable_others)
+        sess.set_ac_input_coupling(channels, cfg.channel_type, cfg.ac_input_coupling)
 
     def _setup_subscription(self, loop: asyncio.AbstractEventLoop) -> None:
         rate = self.settings.subscribe_rate
@@ -558,6 +662,7 @@ class CereLinkSignalSource(BaseProducerUnit[CereLinkSignalSettings, AxisArray, C
 _SPIKE_FS = 30000  # device spike clock — fixed by the protocol
 _NS_PER_SECOND = 1_000_000_000
 _UNIT_LABELS = np.array(["unsorted", "1", "2", "3", "4", "5", "noise"], dtype="U8")
+_SPKOPTS_EXTRACT = 1  # cbAINPSPK_EXTRACT bit in SPKOPTS — spike extraction enabled
 
 
 @processor_state
@@ -602,17 +707,28 @@ class CereLinkSpikeProducer(_CereLinkBaseProducer[CereLinkSpikeSettings, CereLin
         self._buffer_lock = threading.Lock()
 
     def _apply_slice_configure(self, cfg: SliceConfig) -> None:
+        if cfg.channels is ChannelSelection.ENABLED:
+            # Leave spike extraction exactly as the device has it; _setup_subscription
+            # subscribes to whatever already has it on. (enable_spiking is ignored.)
+            return
         if cfg.enable_spiking:
-            self.state.session.set_spike_extraction(cfg.channels, cfg.channel_type, True)
+            channels = self._resolve_channels(cfg)
+            self.state.session.set_spike_extraction(channels, cfg.channel_type, True)
+
+    def _enabled_channels(self, channel_type: ChannelType) -> list[int]:
+        """Spike-stream meaning of "enabled" (see base): channels whose spike
+        extraction is currently on (the ``cbAINPSPK_EXTRACT`` bit in SPKOPTS),
+        sorted ascending. Call after a :meth:`sync` so SPKOPTS is fresh."""
+        sess = self.state.session
+        ids = sess.get_matching_channel_ids(channel_type)
+        opts = sess.get_channels_field(channel_type, ChanInfoField.SPKOPTS)
+        return sorted(cid for cid, o in zip(ids, opts) if o & _SPKOPTS_EXTRACT)
 
     def _setup_subscription(self, loop: asyncio.AbstractEventLoop) -> None:
         cfg = self.settings.configure
         if isinstance(cfg, SliceConfig):
             channel_type = cfg.channel_type
-            if cfg.channels is not None:
-                channels = list(cfg.channels)
-            else:
-                channels = self.state.session.get_matching_channel_ids(channel_type)
+            channels = self._resolve_channels(cfg)
         else:
             # CcfConfig or None: subscribe to all FRONTEND. The device's CCF
             # (or whatever's already configured) decides which of these

@@ -53,7 +53,11 @@ class TestChannelMapProcessor:
         assert len(ch_ax.data) == 128
 
     def test_structured_fields(self):
-        """First and last channels have correct label, bank, elec, x, y."""
+        """First and last channels have correct label, bank, elec, x, y.
+
+        Coordinates are in micrometers: the default index grid (col 0-15,
+        row 0-7) is scaled by the 400 µm Utah-array pitch by parse_cmp.
+        """
         proc = _make_processor(CMP_FILE)
         out = proc(_make_message(128))
         data = out.axes["ch"].data
@@ -61,14 +65,18 @@ class TestChannelMapProcessor:
         assert first["label"] == "chan1"
         assert first["bank"] == "A"
         assert first["elec"] == 1
-        assert first["x"] == pytest.approx(0.0)
-        assert first["y"] == pytest.approx(7.0)
+        assert first["x"] == 0  # col 0 * 400 µm
+        assert first["y"] == 2800  # row 7 * 400 µm
+        assert first["size"] == 400  # Utah-array pitch
+        assert first["headstage"] == 0  # hs_id default
         last = data[-1]
         assert last["label"] == "chan128"
         assert last["bank"] == "D"
         assert last["elec"] == 32
-        assert last["x"] == pytest.approx(15.0)
-        assert last["y"] == pytest.approx(0.0)
+        assert last["x"] == 6000  # col 15 * 400 µm
+        assert last["y"] == 0  # row 0 * 400 µm
+        assert last["size"] == 400
+        assert last["headstage"] == 0
 
     def test_original_data_preserved(self):
         proc = _make_processor(CMP_FILE)
@@ -100,6 +108,8 @@ class TestChannelMapProcessor:
         assert data["elec"].shape == (128,)
         assert data["x"].shape == (128,)
         assert data["y"].shape == (128,)
+        assert data["size"].shape == (128,)
+        assert data["headstage"].shape == (128,)
 
     def test_electrode_values(self):
         """Electrode IDs cycle 1-32 within each bank."""
@@ -193,23 +203,29 @@ class TestCmpOverlay:
         out = _make_processor(CMP_FILE)(_make_message(256))
         assert len(out.axes["ch"].data) == 256
 
-    def test_overlay_out_of_range_chan_id_skipped(self):
-        """CMP entries whose chan_id-1 ≥ n_total are ignored, not appended."""
-        proc = _make_processor(CMP_FILE, start_chan=200)  # would write 200..327
+    def test_overlay_out_of_range_index_skipped(self):
+        """CMP entries whose (bank, term) index ≥ n_total are skipped, not appended."""
+        # start_chan=200 → bank offset 200//32 = 6, so CMP banks A-D land on
+        # device banks G-J → indices (7-1)*32 .. (10-1)*32+31 = 192..319.
+        proc = _make_processor(CMP_FILE, start_chan=200)
         out = proc(_make_message(256))
         data = out.axes["ch"].data
         assert len(data) == 256
-        # Indices 199..255 carry the CMP's first 57 entries; rest skipped.
-        assert data[199]["label"] == "chan1"
-        assert data[255]["label"] == "chan57"
+        # chan1 → bank G term 1 → idx 192; banks G-H (chan1..64) fit in 0..255,
+        # banks I-J (idx 256..319) are out of range and dropped.
+        assert data[192]["label"] == "chan1"
+        assert data[255]["label"] == "chan64"
 
-    def test_hs_id_prefixes_labels(self):
-        """hs_id != 0 prefixes labels with 'hs{hs_id}-'."""
+    def test_hs_id_does_not_prefix_labels(self):
+        """Labels are verbatim; hs_id sets the entry's headstage, not the label."""
         proc = _make_processor(CMP_FILE, hs_id=2)
         out = proc(_make_message(128))
-        labels = out.axes["ch"].data["label"]
-        assert labels[0] == "hs2-chan1"
-        assert labels[127] == "hs2-chan128"
+        data = out.axes["ch"].data
+        assert data["label"][0] == "chan1"
+        assert data["label"][127] == "chan128"
+        # hs_id lands in the headstage field instead.
+        assert data["headstage"][0] == 2
+        assert data["headstage"][127] == 2
 
     def test_missing_cmp_keeps_base_layer(self):
         """A bad CMP path warns and leaves the existing axis intact."""
@@ -291,13 +307,13 @@ class TestStatePreservation:
 
 class TestAutoGridPlacement:
     def test_auto_grid_y_offset_below_cmp(self):
-        """Auto-grid rows start below the CMP's max y (gap of +2)."""
+        """Auto-grid rows start below the CMP's max y (gap of 2 pitches = 800 µm)."""
         proc = _make_processor(CMP_FILE)
         out = proc(_make_message(256))
         data = out.axes["ch"].data
         cmp_y_max = float(data["y"][:128].max())
         auto_y_min = float(data["y"][128:].min())
-        assert auto_y_min >= cmp_y_max + 2
+        assert auto_y_min >= cmp_y_max + 800
 
     def test_auto_grid_bank_starts_past_cmp(self):
         """Auto-grid banks start one letter past the CMP's highest bank."""
@@ -311,12 +327,114 @@ class TestAutoGridPlacement:
 
     def test_auto_grid_skips_cmp_indices_with_offset_start_chan(self):
         """With start_chan=129 the CMP fills 128..255; auto-grid lays out 0..127 below."""
+        # start_chan=129 → bank offset 4 → CMP banks A-D land on device banks
+        # E-H, i.e. indices 128..255.
         proc = _make_processor(CMP_FILE, start_chan=129)
         out = proc(_make_message(256))
         data = out.axes["ch"].data
-        # CMP positions on the upper half.
-        assert data[128]["bank"] == "A"  # CMP's first sorted bank
-        # Auto-grid (lower half) is offset below CMP's max y (=7) → y >= 9.
-        assert data[0]["y"] >= 9.0
-        # And uses banks past CMP's max (D) → starts at E.
-        assert data[0]["bank"] == "E"
+        # CMP positions on the upper half, starting at device bank E.
+        assert data[128]["bank"] == "E"
+        # Auto-grid (lower half) sits below CMP's max y (2800 µm) by 2 pitches.
+        assert data[0]["y"] >= 3600.0
+        # And uses banks past CMP's max (H) → starts at I.
+        assert data[0]["bank"] == "I"
+
+
+# ---------------------------------------------------------------------------
+# Source-provided geometry (no CMP file needed)
+# ---------------------------------------------------------------------------
+
+
+def _make_message_passthrough(n_channels: int, positions: np.ndarray, n_time: int = 5) -> AxisArray:
+    """Build a message whose ``ch`` axis already carries CHANNEL_DTYPE geometry,
+    mimicking a CereLink source that read positions from device chaninfo.
+
+    ``positions`` is an ``(n_channels, 2)`` array of (x, y) in micrometers.
+    """
+    ch_data = np.zeros(n_channels, dtype=CHANNEL_DTYPE)
+    for i in range(n_channels):
+        ch_data[i]["x"] = positions[i, 0]
+        ch_data[i]["y"] = positions[i, 1]
+        ch_data[i]["size"] = 400
+        ch_data[i]["label"] = f"src{i}"
+        ch_data[i]["bank"] = chr(ord("A") + i // 32)
+        ch_data[i]["elec"] = (i % 32) + 1
+        ch_data[i]["headstage"] = 1
+    return AxisArray(
+        data=np.zeros((n_time, n_channels)),
+        dims=["time", "ch"],
+        axes={
+            "time": LinearAxis(offset=0.0, gain=0.001),
+            "ch": CoordinateAxis(data=ch_data, dims=["ch"]),
+        },
+    )
+
+
+class TestSourceGeometry:
+    def test_source_positions_preserved_without_cmp(self):
+        """Structured x/y/size/bank/elec/headstage from the source flow through
+        verbatim when no CMP file is configured."""
+        pos = np.column_stack([(np.arange(64) % 8) * 400, (np.arange(64) // 8) * 400])
+        proc = _make_processor(None)  # empty cmp_configs
+        out = proc(_make_message_passthrough(64, pos))
+        data = out.axes["ch"].data
+        np.testing.assert_array_equal(data["x"], pos[:, 0])
+        np.testing.assert_array_equal(data["y"], pos[:, 1])
+        assert data[0]["label"] == "src0"
+        assert data[0]["size"] == 400
+        assert data[0]["headstage"] == 1
+        # Every channel is source-placed → nothing auto-gridded.
+        assert proc.state.src_mask.all()
+        assert not proc.state.cmp_mask.any()
+
+    def test_cmp_overrides_source_positions(self):
+        """A CMP overlay wins over source geometry at the indices it claims."""
+        pos = np.column_stack([(np.arange(128) % 16) * 999, (np.arange(128) // 16) * 999])
+        proc = _make_processor(CMP_FILE)  # start_chan=1 → indices 0..127
+        out = proc(_make_message_passthrough(128, pos))
+        data = out.axes["ch"].data
+        # CMP labels/coords replaced the source ones.
+        assert data[0]["label"] == "chan1"
+        assert data[0]["x"] == 0
+        assert data[127]["label"] == "chan128"
+        assert proc.state.cmp_mask.all()
+        # src_mask cleared where the CMP took over.
+        assert not (proc.state.src_mask & proc.state.cmp_mask).any()
+
+    def test_unmapped_origin_pileup_falls_through_to_auto_grid(self):
+        """The first (0, 0) channel is kept; later origin channels (the device's
+        'unmapped' sentinel) are auto-gridded below the real geometry."""
+        pos = np.array([[0, 0], [400, 0], [0, 0], [0, 0]])
+        proc = _make_processor(None)
+        out = proc(_make_message_passthrough(4, pos))
+        data = out.axes["ch"].data
+        # ch0: lone-kept origin electrode; ch1: real position.
+        assert (data[0]["x"], data[0]["y"]) == (0, 0)
+        assert (data[1]["x"], data[1]["y"]) == (400, 0)
+        assert proc.state.src_mask[0] and proc.state.src_mask[1]
+        # ch2/ch3: duplicate origins → auto-gridded, not left stacked at (0,0).
+        assert not proc.state.src_mask[2]
+        assert not proc.state.src_mask[3]
+        auto_y = min(int(data[2]["y"]), int(data[3]["y"]))
+        assert auto_y >= int(data["y"][proc.state.src_mask].max()) + 2 * 400
+
+    def test_auto_grid_sits_below_source_geometry(self):
+        """With a partial source map, the auto-grid offsets below the source's
+        max y, same as it does below CMP geometry."""
+        # 4 source-placed channels on a 400 µm grid; 4 unmapped origin dupes.
+        pos = np.array([[0, 0], [400, 0], [0, 400], [400, 400], [0, 0], [0, 0], [0, 0], [0, 0]])
+        proc = _make_processor(None)
+        out = proc(_make_message_passthrough(8, pos))
+        data = out.axes["ch"].data
+        src_y_max = int(data["y"][proc.state.src_mask].max())
+        auto_y_min = int(data["y"][~proc.state.src_mask].min())
+        assert auto_y_min >= src_y_max + 800
+
+    def test_unstructured_incoming_still_auto_grids_from_origin(self):
+        """Label-only / plain incoming axes keep the original pure auto-grid."""
+        proc = _make_processor(None)
+        out = proc(_make_message(64))  # ch_data = np.arange(64), unstructured
+        data = out.axes["ch"].data
+        assert data[0]["x"] == 0
+        assert data[0]["y"] == 0
+        assert not proc.state.src_mask.any()

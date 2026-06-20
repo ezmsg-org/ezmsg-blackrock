@@ -613,7 +613,7 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
                 try:
                     new_offset = st.session.device_to_monotonic(first_ts)
                 except RuntimeError:
-                    new_offset = time.monotonic()
+                    new_offset = time.monotonic() - st.template.axes["time"].gain * len(out_dat)
 
             template = st.template
             new_time_ax = replace(template.axes["time"], offset=new_offset)

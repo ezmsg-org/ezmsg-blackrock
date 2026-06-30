@@ -19,6 +19,7 @@ from ezmsg.util.messages.axisarray import AxisArray, replace
 from pycbsdk import ChanInfoField, ChannelType, DeviceType, SampleRate, Session
 
 from .channel_map import CHANNEL_DTYPE, ChannelMapSettings
+from .clock import device_to_monotonic_batch_offsets
 
 logger = logging.getLogger(__name__)
 
@@ -606,13 +607,17 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
             if self.settings.microvolts:
                 out_dat = out_dat * st.scale_factors[None, :]
 
-            first_ts = int(st.buffer_timestamps[read_idx])
+            ts_batch = st.buffer_timestamps[read_slice]
             if self.settings.cbtime:
-                new_offset = first_ts / 1e9
+                new_offset = int(ts_batch[0]) / 1e9
             else:
-                try:
-                    new_offset = st.session.device_to_monotonic(first_ts)
-                except RuntimeError:
+                # Must convert entire batch for monotonicity.
+                offsets = device_to_monotonic_batch_offsets(
+                    st.session, ts_batch, stream_id=int(self.settings.subscribe_rate)
+                )
+                if offsets is not None:
+                    new_offset = offsets[0]
+                else:
                     new_offset = time.monotonic() - st.template.axes["time"].gain * len(out_dat)
 
             template = st.template
@@ -661,6 +666,7 @@ class CereLinkSignalSource(BaseProducerUnit[CereLinkSignalSettings, AxisArray, C
 
 _SPIKE_FS = 30000  # device spike clock — fixed by the protocol
 _NS_PER_SECOND = 1_000_000_000
+_SPIKE_STREAM_ID = 100  # monotonicity stream_id, distinct from sample-rate ids (1..6)
 _UNIT_LABELS = np.array(["unsorted", "1", "2", "3", "4", "5", "noise"], dtype="U8")
 _SPKOPTS_EXTRACT = 1  # cbAINPSPK_EXTRACT bit in SPKOPTS — spike extraction enabled
 
@@ -860,10 +866,15 @@ class CereLinkSpikeProducer(_CereLinkBaseProducer[CereLinkSpikeSettings, CereLin
         if self.settings.cbtime:
             new_offset = emit_origin_ns / 1e9
         else:
-            try:
-                new_offset = st.session.device_to_monotonic(emit_origin_ns)
-            except RuntimeError:
+            # Must convert entire batch for monotonicity.
+            last_ns = emit_origin_ns + ((st.n_t - 1) * _NS_PER_SECOND) // _SPIKE_FS
+            offsets = device_to_monotonic_batch_offsets(
+                st.session, (emit_origin_ns, last_ns), stream_id=_SPIKE_STREAM_ID
+            )
+            if offsets is None:
                 new_offset = time.monotonic()
+            else:
+                new_offset = offsets[0]
 
         template = st.template
         new_time_ax = replace(template.axes["time"], offset=new_offset)

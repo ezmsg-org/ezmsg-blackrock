@@ -1,9 +1,12 @@
 """Attach Blackrock ``.cmp`` channel-map metadata to an ``AxisArray``'s ``ch`` axis.
 
 The output ``ch`` axis is a structured ``CoordinateAxis`` with fields
-``x``, ``y``, ``size``, ``label``, ``bank``, ``elec``, ``headstage`` for every
-input channel. ``x``/``y``/``size`` are in micrometers; ``headstage`` is the
-1-based headstage id (``0`` = none/auto).
+``x``, ``y``, ``size``, ``label``, ``bank``, ``elec``, ``headstage``, ``array``
+for every input channel. ``x``/``y``/``size`` are in micrometers;
+``headstage`` is the 1-based headstage id (``0`` = none/auto); ``array`` is the
+electrode-array identity derived from the label (see :func:`_array_identity`),
+which groups channels by physical array rather than by 32-channel connector
+bank — the useful grouping for per-array rereferencing.
 
 :class:`ChannelMapUnit` takes the *complete* set of per-headstage overlays in
 one settings object (:class:`ChannelMapUnitSettings`, a tuple of
@@ -64,8 +67,50 @@ CHANNEL_DTYPE = np.dtype(
         ("bank", "U1"),
         ("elec", "i4"),
         ("headstage", "i4"),  # 1-based headstage id (0 = none/auto)
+        # Electrode-array identity, e.g. "hs1-elec1-m1". One value per
+        # physically distinct array; see _array_identity.
+        ("array", "U32"),
     ]
 )
+
+
+def _array_identity(label: str, headstage: int, bank: str = "") -> str:
+    """Electrode-array identity for a channel.
+
+    Two channels belong to the same array iff they share a *connector* -- the
+    label prefix before the first ``-``, which the CMP assigns per physical
+    64-channel connector (``elec1`` in ``elec1-m1-63``) -- on the same
+    headstage. The connector label repeats across headstages, so the headstage
+    is prefixed when known; without it the same ``.cmp`` loaded twice, or a
+    bilateral implant, would merge two physically distinct arrays::
+
+        ("elec1-m1-63", 1) -> "hs1-elec1"
+        ("elec1-m1-63", 2) -> "hs2-elec1"
+        ("elec1-m1-63", 0) -> "elec1"
+
+    Grouping on the connector rather than the whole label stem is deliberate:
+    the region token is an annotation of where the array was implanted, and a
+    connector whose channels carry inconsistent region labels is still one
+    array. It also matches the offline convention in intent-pipelines
+    (``_array_ids_from_metadata``), so weights fitted offline and applied live
+    see the same clusters.
+
+    Labels with no connector structure (``chan1``, or an auto-grid channel with
+    no label) fall back to the connector *bank*::
+
+        ("chan1", 1, "A") -> "hs1-bankA"
+
+    so grouping by ``array`` degrades to bank-level grouping rather than
+    collapsing every such channel into one cluster spanning the whole device.
+    Returns ``""`` only when neither a label nor a bank is available.
+    """
+    hs = int(headstage or 0)
+    prefix = f"hs{hs}-" if hs > 0 else ""
+    connector, sep, _rest = str(label or "").partition("-")
+    if sep and connector:
+        return f"{prefix}{connector}"
+    bank = str(bank or "")
+    return f"{prefix}bank{bank}" if bank else ""
 
 
 class ChannelMapSettings(ez.Settings):
@@ -158,6 +203,7 @@ class ChannelMapProcessor(BaseStatefulTransformer[ChannelMapUnitSettings, AxisAr
                 ch_data[idx]["bank"] = chr(ord("A") + bank - 1)
                 ch_data[idx]["elec"] = term
                 ch_data[idx]["headstage"] = entry.headstage
+                ch_data[idx]["array"] = _array_identity(entry.label, entry.headstage, chr(ord("A") + bank - 1))
                 cmp_mask[idx] = True
 
         self.state.channel_axis = CoordinateAxis(data=ch_data, dims=["ch"], unit="struct")
@@ -190,7 +236,7 @@ class ChannelMapProcessor(BaseStatefulTransformer[ChannelMapUnitSettings, AxisAr
         if incoming is None or not names or not ({"x", "y"} <= set(names)):
             return src_mask
 
-        copy_fields = [f for f in ("x", "y", "size", "bank", "elec", "headstage") if f in names]
+        copy_fields = [f for f in ("x", "y", "size", "bank", "elec", "headstage", "array") if f in names]
         seen_origin = False
         for i in range(min(n_total, incoming.shape[0])):
             for f in copy_fields:
@@ -237,9 +283,13 @@ class ChannelMapProcessor(BaseStatefulTransformer[ChannelMapUnitSettings, AxisAr
             ch_data[idx]["x"] = (i % grid_size) * step
             ch_data[idx]["y"] = start_row + (i // grid_size) * step
             ch_data[idx]["size"] = step  # synthetic electrodes sized to the grid pitch
-            ch_data[idx]["bank"] = chr(next_bank_ord + i // 32)
+            auto_bank = chr(next_bank_ord + i // 32)
+            ch_data[idx]["bank"] = auto_bank
             ch_data[idx]["elec"] = (i % 32) + 1
             ch_data[idx]["headstage"] = 0  # auto-grid channels have no headstage
+            # No label to derive an array from, so this falls back to the
+            # synthetic bank -- 32-channel clusters, as if grouped by bank.
+            ch_data[idx]["array"] = _array_identity("", 0, auto_bank)
 
     @staticmethod
     def _placed_pitch(ch_data: np.ndarray, placed_mask: np.ndarray) -> int:

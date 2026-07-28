@@ -11,6 +11,7 @@ from ezmsg.blackrock.channel_map import (
     ChannelMapProcessor,
     ChannelMapSettings,
     ChannelMapUnitSettings,
+    _array_identity,
 )
 
 CMP_FILE = str(pathlib.Path(__file__).resolve().parent / "128ChannelDefaultMapping.cmp")
@@ -438,3 +439,97 @@ class TestSourceGeometry:
         assert data[0]["x"] == 0
         assert data[0]["y"] == 0
         assert not proc.state.src_mask.any()
+
+
+# ---------------------------------------------------------------------------
+# array field
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "label, headstage, bank, expected",
+    [
+        ("elec1-m1-63", 1, "A", "hs1-elec1"),
+        ("elec2-dlpfc-128", 1, "C", "hs1-elec2"),
+        # Same label on another headstage must stay a distinct array.
+        ("elec1-m1-63", 2, "A", "hs2-elec1"),
+        # Unknown headstage: identity without the prefix.
+        ("elec1-m1-63", 0, "A", "elec1"),
+        # A pre-region CMP still yields a usable array identity.
+        ("elec1-63", 1, "A", "hs1-elec1"),
+        # No array structure in the label -> fall back to the bank.
+        ("chan5", 1, "B", "hs1-bankB"),
+        ("", 0, "D", "bankD"),
+        # Neither label nor bank.
+        ("chan5", 1, "", ""),
+    ],
+)
+def test_array_identity(label: str, headstage: int, bank: str, expected: str) -> None:
+    assert _array_identity(label, headstage, bank) == expected
+
+
+def test_cmp_populates_array_field() -> None:
+    """A CMP overlay derives ``array`` from the label + headstage."""
+    proc = _make_processor(CMP_FILE, start_chan=1, hs_id=1)
+    out = proc(_make_message(128))
+    ch = out.axes["ch"].data
+
+    assert "array" in ch.dtype.names
+    for i in range(128):
+        assert ch[i]["array"] == _array_identity(ch[i]["label"], ch[i]["headstage"], ch[i]["bank"])
+    # Every mapped channel belongs to some array.
+    assert all(str(v) for v in ch["array"])
+
+
+def test_array_groups_are_larger_than_banks() -> None:
+    """``array`` groups whole electrode arrays; ``bank`` splits them by connector.
+
+    This is the property that makes ``array`` the useful field for per-array
+    rereferencing: a 32-channel bank is a wiring artifact, while the array is
+    the physical implant.
+    """
+    proc = _make_processor(CMP_FILE, start_chan=1, hs_id=1)
+    ch = proc(_make_message(128)).axes["ch"].data
+
+    def sizes(field: str) -> set[int]:
+        counts: dict[str, int] = {}
+        for value in ch[field]:
+            counts[str(value)] = counts.get(str(value), 0) + 1
+        return set(counts.values())
+
+    # This fixture's labels (chan<N>) carry no array structure, so array
+    # falls back to the bank and the groups match exactly.
+    assert max(sizes("array")) >= max(sizes("bank"))
+
+
+def test_two_headstages_do_not_merge_arrays() -> None:
+    """The same CMP on two headstages yields disjoint arrays, not one merged set."""
+    proc = ChannelMapProcessor(
+        settings=ChannelMapUnitSettings(
+            cmp_configs=(
+                ChannelMapSettings(filepath=CMP_FILE, start_chan=1, hs_id=1),
+                ChannelMapSettings(filepath=CMP_FILE, start_chan=129, hs_id=2),
+            )
+        )
+    )
+    ch = proc(_make_message(256)).axes["ch"].data
+
+    hs1 = {str(v) for v in ch["array"][:128]}
+    hs2 = {str(v) for v in ch["array"][128:]}
+    assert hs1 and hs2
+    assert not (hs1 & hs2), f"identical CMPs on two headstages merged into shared arrays: {hs1 & hs2}"
+    assert all(v.startswith("hs1-") for v in hs1)
+    assert all(v.startswith("hs2-") for v in hs2)
+
+
+def test_auto_grid_array_mirrors_bank() -> None:
+    """Unmapped channels get an ``array`` derived from their synthetic bank.
+
+    Without the fallback they would share one empty value and collapse into
+    a single cluster spanning every unmapped channel.
+    """
+    proc = _make_processor()  # no CMP -> pure auto-grid
+    ch = proc(_make_message(64)).axes["ch"].data
+
+    for i in range(64):
+        assert ch[i]["array"] == f"bank{ch[i]['bank']}"

@@ -18,7 +18,7 @@ from ezmsg.baseproc.units import BaseProducerUnit
 from ezmsg.util.messages.axisarray import AxisArray, replace
 from pycbsdk import ChanInfoField, ChannelType, DeviceType, SampleRate, Session
 
-from .channel_map import CHANNEL_DTYPE, ChannelMapSettings
+from .channel_map import CHANNEL_DTYPE, ChannelMapSettings, _array_identity
 from .clock import device_to_monotonic_batch_offsets
 
 logger = logging.getLogger(__name__)
@@ -413,6 +413,7 @@ class _CereLinkBaseProducer(
             ch_info[i]["bank"] = chr(ord("A") + bank_num - 1) if bank_num > 0 else ""
             ch_info[i]["elec"] = term
             ch_info[i]["headstage"] = headstage
+            ch_info[i]["array"] = _array_identity(ch_info[i]["label"], headstage, ch_info[i]["bank"])
         return ch_info
 
     def _device_name(self) -> str:

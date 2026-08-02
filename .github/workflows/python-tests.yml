@@ -2,7 +2,9 @@ name: Test package
 
 on:
   push:
-    branches: [main]
+    # dev is included so merges populate the branch-scoped test-data cache that
+    # PRs (which can only read caches from their base branch) restore from.
+    branches: [main, dev]
   pull_request:
     branches:
       - main
@@ -22,6 +24,18 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # conftest.py skips any download whose zip already exists, so restoring
+      # the zips is enough; extraction is re-done cheaply per run. The key
+      # hashes conftest.py -- it holds the release URL and asset names, so a
+      # data-version bump invalidates the cache. No restore-keys on purpose:
+      # the zip filenames are unversioned, and a stale dnss256.zip restored
+      # under a new key would be silently used as current.
+      - name: Cache test data
+        uses: actions/cache@v4
+        with:
+          path: tests/.test_cache/*.zip
+          key: test-data-unit-${{ runner.os }}-${{ hashFiles('tests/conftest.py') }}
 
       - name: Install the latest version of uv
         uses: astral-sh/setup-uv@v6
@@ -53,6 +67,19 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # Separate key from the unit job: this one also holds the platform
+      # nPlayServer zip, which would otherwise never be cached (the unit jobs
+      # save the shared key first, without it). Falling back to the unit key is
+      # safe because it carries the same conftest hash, so the restored zips
+      # are current and only nPlayServer is fetched on top.
+      - name: Cache test data
+        uses: actions/cache@v4
+        with:
+          path: tests/.test_cache/*.zip
+          key: test-data-integration-${{ runner.os }}-${{ hashFiles('tests/conftest.py') }}
+          restore-keys: |
+            test-data-unit-${{ runner.os }}-${{ hashFiles('tests/conftest.py') }}
 
       - name: Install the latest version of uv
         uses: astral-sh/setup-uv@v6

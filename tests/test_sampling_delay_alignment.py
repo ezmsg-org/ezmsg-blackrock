@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 from ezmsg.util.messages.axisarray import AxisArray, CoordinateAxis, LinearAxis
 
+import ezmsg.blackrock.sampling_delay_alignment as sda
 from ezmsg.blackrock.sampling_delay_alignment import (
     SamplingDelayAlignmentSettings,
     SamplingDelayAlignmentTransformer,
@@ -405,3 +406,83 @@ def test_mlx_conv_weight_is_built_once_per_state():
     w = proc.state.conv_w
     proc(msg(100, 50))  # a different chunk length must not trigger a rebuild
     assert proc.state.conv_w is w
+
+
+# ---------------------------------------------------------------------------
+# numba fast path (numpy backend, optional accel extra)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _no_numba(monkeypatch):
+    """Force the portable Array-API path by hiding the numba kernels, so a test
+    can compare against it regardless of whether numba is installed."""
+    monkeypatch.setattr(sda, "_nb", None)
+
+
+def test_numba_path_matches_portable(_no_numba):
+    """With numba installed the numpy FIR and rail fill reproduce the portable
+    tap-sum + scan (to float32), and the streaming result is chunk-invariant.
+
+    The chunk list spans the serial/parallel FIR split (one chunk exceeds
+    ``PARALLEL_MIN_SAMPLES``) so both jitted kernels run."""
+    nb = pytest.importorskip("ezmsg.blackrock._numba_kernels")
+    assert sda._nb is None  # fixture applied; recompute the portable reference
+    n, nch = 12000, 48
+    x = np.random.default_rng(20).standard_normal((n, nch)).astype(np.float32)
+    x[1000:1004, 6] = 1e4  # a railed run for the forward-fill
+    y_portable = _stream(sampling_delay_alignment(rail_threshold=8000.0), x, [n])
+
+    # Restore numba and run the same data, chunked across the parallel threshold.
+    sda._nb = nb
+    chunks = [3, 30, 300, nb.PARALLEL_MIN_SAMPLES + 5]
+    chunks.append(n - sum(chunks))
+    proc = sampling_delay_alignment(rail_threshold=8000.0)
+    y_numba = _stream(proc, x, chunks)
+
+    assert proc.state.nb_w is not None
+    assert proc.state.nb_w.shape == (13, nch)
+    np.testing.assert_allclose(y_numba, y_portable, rtol=1e-6, atol=1e-5)
+
+
+def test_numba_path_preserves_float64(_no_numba):
+    """The jitted FIR keeps the input dtype (float64 in -> float64 out), matching
+    the portable path rather than forcing float32 like the MLX conv."""
+    nb = pytest.importorskip("ezmsg.blackrock._numba_kernels")
+    x = np.random.default_rng(21).standard_normal((400, 16)).astype(np.float64)
+    y_portable = sampling_delay_alignment()(_aa(x)).data
+    assert y_portable.dtype == np.float64
+
+    sda._nb = nb
+    proc = sampling_delay_alignment()
+    out = proc(_aa(x))
+    assert proc.state.nb_w.dtype == np.float64
+    assert out.data.dtype == np.float64
+    np.testing.assert_allclose(out.data, y_portable, rtol=1e-6, atol=1e-9)
+
+
+def test_numba_rail_fill_matches_portable():
+    """The jitted forward-fill reproduces the scan's held values, including a
+    leading rail (falls back to the first sample) and a trailing rail."""
+    nb = pytest.importorskip("ezmsg.blackrock._numba_kernels")
+    x = np.random.default_rng(22).standard_normal((300, 8)).astype(np.float32)
+    x[0:2, 0] = 1e4  # leading rail
+    x[100:130, 3] = 1e4  # long run
+    x[-1, 7] = 1e4  # trailing rail
+
+    flat = np.ascontiguousarray(x).reshape(x.shape[0], -1)
+    out = np.empty_like(flat)
+    nb.fill_rails(flat, 8000.0, out)
+
+    portable = SamplingDelayAlignmentTransformer._fill_rails(x, 8000.0, _NoAccumulateNamespace(), False)
+    np.testing.assert_array_equal(out.reshape(x.shape), portable)
+
+
+def test_numba_weight_absent_without_numba(_no_numba):
+    """No numba -> nb_w stays None and the transformer uses the portable path
+    (and still produces correct output)."""
+    proc = sampling_delay_alignment()
+    x = np.random.default_rng(23).standard_normal((200, 32)).astype(np.float32)
+    out = proc(_aa(x))
+    assert proc.state.nb_w is None
+    assert out.data.shape == x.shape

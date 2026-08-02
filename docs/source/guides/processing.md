@@ -117,14 +117,24 @@ below the noise floor at three times the latency.
 ### Performance
 
 The transformer runs once per message, so per-message cost at live chunk sizes —
-tens of samples, not thousands — is what matters. On MLX the FIR is evaluated as
-a single depthwise convolution (one group per channel, kernel laid out once at
-state reset) rather than one dispatched multiply-add per tap, which is about
-2–3× faster per message and roughly flat from 3 to 1000 samples. The rail
-forward-fill's running max likewise uses `mx.cummax` on MLX and the `maximum`
-ufunc's `accumulate` on numpy/cupy, falling back to the portable log-depth scan
-elsewhere. `examples/bench_sampling_delay_alignment.py` reports all of this
-across channel counts, message sizes, and rail handling on/off.
+tens of samples, not thousands — is what matters. The portable Array-API
+implementation (the per-tap multiply-add loop and a log-depth rail scan) runs on
+any backend; two optional fast paths sit on top of it:
+
+- **MLX.** The FIR is evaluated as a single depthwise convolution (one group per
+  channel, kernel laid out once at state reset) rather than one dispatched
+  multiply-add per tap — about 2–3× faster per message and roughly flat from 3
+  to 1000 samples. The rail forward-fill's running max uses `mx.cummax`.
+- **numpy, with the optional `accel` extra (`pip install ezmsg-blackrock[accel]`,
+  which pulls in `numba`).** Both the FIR and the rail forward-fill run as fused
+  single-pass JIT-compiled kernels — roughly 3× faster than the tap loop at live
+  chunk sizes, and, via a threaded variant that engages automatically for large
+  buffers, an order of magnitude faster for offline batch processing of whole
+  recordings. Without the extra, numpy uses the portable path (the rail scan
+  taking the `maximum.accumulate` one-pass form), so nothing here is required.
+
+`examples/bench_sampling_delay_alignment.py` reports all of this across channel
+counts, message sizes, rail handling on/off, and fast-path versus portable.
 
 A few things to keep in mind:
 

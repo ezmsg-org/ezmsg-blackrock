@@ -44,15 +44,21 @@ the rail forward-fill -- runs on the backend using only standard Array-API ops
 standard lacks one). Only MLX's ``concatenate``-vs-``concat`` spelling needs
 special-casing.
 
-Two backend-specific fast paths sit on top of that, because live acquisition
+Backend-specific fast paths sit on top of that, because live acquisition
 delivers chunks of a few dozen samples where per-operation dispatch, not
 arithmetic, sets the wall time:
   * on MLX the FIR runs as a single depthwise ``conv_general`` (one group per
     column, kernel cached at state reset) instead of ``filter_len`` multiply-add
     stages -- ~2-3x less time per message, and roughly flat in chunk size;
-  * the forward-fill's running max uses ``mx.cummax`` on MLX and the ``maximum``
-    ufunc's ``accumulate`` on numpy/cupy, in place of the log-depth scan.
-Both fall back to the portable formulation wherever those ops are missing.
+  * on numpy, if the optional ``numba`` dependency is installed, both the FIR
+    and the rail forward-fill run as fused single-pass jitted kernels (see
+    :mod:`ezmsg.blackrock._numba_kernels`): several times faster than the tap
+    loop at live sizes and, with a threaded FIR for large buffers, ~20x faster
+    for offline batch processing;
+  * the forward-fill's running max otherwise uses ``mx.cummax`` on MLX and the
+    ``maximum`` ufunc's ``accumulate`` on numpy/cupy, in place of the log scan.
+All of these fall back to the portable formulation wherever the op or the
+optional dependency is missing.
 """
 
 from typing import Any
@@ -74,9 +80,20 @@ try:  # pragma: no cover - exercised only when mlx is installed
 except Exception:  # pragma: no cover
     _mx = None
 
+try:  # optional accel extra; the numpy path works without it
+    from . import _numba_kernels as _nb
+except Exception:  # pragma: no cover - numba not installed
+    _nb = None
+
 
 def _is_mlx(arr: object) -> bool:
     return _mx is not None and isinstance(arr, _mx.array)
+
+
+def _use_numba(arr: object) -> bool:
+    """Whether the jitted kernels apply: numba installed and a plain numpy array
+    (torch/jax/cupy arrays aren't ``np.ndarray`` and keep the portable path)."""
+    return _nb is not None and isinstance(arr, np.ndarray)
 
 
 def _namespace(arr: object) -> tuple[Any, bool]:
@@ -148,6 +165,12 @@ class SamplingDelayAlignmentState:
     taps as :attr:`fir`, reversed and laid out per flattened sample column.
     ``None`` on every other backend (and when the taps don't broadcast over
     ``sample_shape``), which selects the portable tap-sum instead."""
+
+    nb_w: npt.NDArray | None = None
+    """numba FIR kernel weights, shape ``(filter_len, n_cols)`` -- the same taps
+    as :attr:`fir`, reversed and laid out per flattened sample column, in the
+    data dtype. Set only on the numpy backend when numba is installed; ``None``
+    otherwise, which selects the portable tap-sum."""
 
     hist: npt.NDArray | None = None
     """Carried input history, shape ``(filter_len-1, *sample_shape)``."""
@@ -235,16 +258,19 @@ class SamplingDelayAlignmentTransformer(
             self._state.fir = xp.astype(xp.asarray(h), dtype)
             self._state.hist = xp.zeros((n_taps - 1,) + sample_shape, dtype=dtype)
             self._state.conv_w = None
+            self._state.nb_w = self._column_taps(h, sample_shape, dtype) if _use_numba(message.data) else None
 
     @staticmethod
-    def _mlx_conv_weight(h: npt.NDArray, sample_shape: tuple[int, ...], dtype: Any) -> Any:
-        """Lay the designed taps out as an MLX depthwise-conv kernel, once.
+    def _column_taps(h: npt.NDArray, sample_shape: tuple[int, ...], dtype: Any) -> npt.NDArray | None:
+        """Per-column, time-reversed taps ``(n_taps, n_cols)`` in ``dtype``.
 
-        ``mx.conv_general`` cross-correlates over one group per input column, so
-        the kernel is the per-column taps reversed, shaped ``(n_cols, n_taps, 1)``
-        with ``n_cols = prod(sample_shape)`` in the same row-major order
-        ``_process`` flattens the data. Returns ``None`` (keep the tap-sum) when
-        the per-channel taps don't broadcast over ``sample_shape``.
+        Both the MLX conv and the numba FIR consume ``xext`` flattened to
+        ``(time, n_cols)`` with ``n_cols = prod(sample_shape)`` in the same
+        row-major order ``_process`` uses, and both cross-correlate, so they want
+        the taps broadcast over the sample shape and reversed in time. Returns
+        ``None`` when the per-channel taps don't broadcast over ``sample_shape``
+        (the last sample axis isn't the ``n_ch`` the filters were designed for),
+        which keeps the portable tap-sum.
         """
         n_taps, n_ch = h.shape
         if not sample_shape or sample_shape[-1] != n_ch:
@@ -253,7 +279,20 @@ class SamplingDelayAlignmentTransformer(
             h.reshape((n_taps,) + (1,) * (len(sample_shape) - 1) + (n_ch,)),
             (n_taps,) + tuple(sample_shape),
         ).reshape(n_taps, -1)
-        w = np.ascontiguousarray(cols[::-1].T, dtype=np.float32)[:, :, None]
+        return np.ascontiguousarray(cols[::-1], dtype=dtype)
+
+    @classmethod
+    def _mlx_conv_weight(cls, h: npt.NDArray, sample_shape: tuple[int, ...], dtype: Any) -> Any:
+        """Lay the designed taps out as an MLX depthwise-conv kernel, once.
+
+        ``mx.conv_general`` cross-correlates over one group per input column, so
+        the kernel is :meth:`_column_taps` transposed to ``(n_cols, n_taps, 1)``.
+        Returns ``None`` (keep the tap-sum) when the taps don't broadcast.
+        """
+        cols = cls._column_taps(h, sample_shape, np.float32)  # (n_taps, n_cols)
+        if cols is None:
+            return None
+        w = np.ascontiguousarray(cols.T, dtype=np.float32)[:, :, None]
         # conv_general needs input and kernel in one dtype; use the dtype the
         # tap-sum's float32-taps-times-data product would have promoted to.
         out_dtype = (_mx.zeros(1, dtype=dtype) * _mx.zeros(1, dtype=_mx.float32)).dtype
@@ -271,10 +310,16 @@ class SamplingDelayAlignmentTransformer(
         The Array-API standard has no cumulative max, so the running max is built
         from ``maximum`` + shifts as a Hillis-Steele scan: O(n log n) backend
         calls, fully vectorized, and correct everywhere. It is also the dominant
-        per-message cost once the FIR is fast, so backends that can do the scan
-        in one pass take it -- ``cummax`` on MLX, the ``maximum`` ufunc's
-        ``accumulate`` on numpy/cupy. Only runs when ``rail_threshold`` is set.
+        per-message cost once the FIR is fast, so faster forms are taken where
+        available -- a fused single left-to-right pass in numba (numpy + accel
+        extra), else ``cummax`` on MLX and the ``maximum`` ufunc's ``accumulate``
+        on numpy/cupy. Only runs when ``rail_threshold`` is set.
         """
+        if _use_numba(x):
+            flat = np.ascontiguousarray(x).reshape(x.shape[0], -1)
+            out = np.empty_like(flat)
+            _nb.fill_rails(flat, float(thresh), out)
+            return out.reshape(x.shape)
         n = x.shape[0]
         sample_shape = x.shape[1:]
         ar = xp.reshape(xp.arange(n), (n,) + (1,) * (x.ndim - 1))
@@ -323,6 +368,13 @@ class SamplingDelayAlignmentTransformer(
             xin = xext if xext.dtype == st.conv_w.dtype else xext.astype(st.conv_w.dtype)
             y = _mx.conv_general(_mx.reshape(xin, (1, xext.shape[0], n_cols)), st.conv_w, groups=n_cols)
             y = _mx.reshape(y, (n,) + x.shape[1:])
+        elif st.nb_w is not None:
+            # Same sum as one fused jitted pass over the flattened columns.
+            n_cols = st.nb_w.shape[1]
+            xin = np.ascontiguousarray(xext).reshape(xext.shape[0], n_cols)
+            yflat = np.empty((n, n_cols), dtype=xext.dtype)
+            _nb.fir(xin, st.nb_w, yflat)
+            y = yflat.reshape((n,) + x.shape[1:])
         else:
             y = xp.zeros_like(x)
             for k in range(n_taps):

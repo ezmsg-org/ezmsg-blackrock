@@ -16,6 +16,14 @@ dependencies = [
     "scipy",
 ]
 
+[project.optional-dependencies]
+accel = [
+    # JIT-compiled kernels for SamplingDelayAlignment's numpy path (FIR and
+    # rail forward-fill). Strictly optional: without numba the portable
+    # Array-API implementation is used.
+    "numba>=0.59",
+]
+
 [dependency-groups]
 dev = [
   "typer>=0.12.5",
@@ -30,6 +38,8 @@ test = [
   "pytest",
   "pytest-timeout",
   "ezmsg-neo>=0.5.0",
+  # So CI exercises the numba-jitted SamplingDelayAlignment kernels.
+  "numba>=0.59",
 ]
 docs = [
   "sphinx>=7.0",

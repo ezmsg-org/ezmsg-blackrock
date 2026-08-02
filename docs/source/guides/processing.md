@@ -92,6 +92,50 @@ Set `filter_len` to `0` to disable alignment entirely — the transformer become
 a pass-through that returns its input unchanged, handy for A/B comparisons or for
 leaving the unit wired in but inert.
 
+### Choosing `filter_len`
+
+Longer filters flatten the response nearer Nyquist but add latency: the bulk
+delay is `(filter_len-1)//2` samples. The table below is the worst case over all
+32 within-bank fractional delays at 30 kHz, and is pinned by
+`tests/test_sampling_delay_alignment.py`:
+
+| Passband | `filter_len` | Max phase error | Max magnitude error | Bulk delay |
+|---|---|---|---|---|
+| 0–500 Hz (LFP) | 7 | 0.0009° | 0.00001 dB | 3 samples (100 µs) |
+| 0–3 kHz | 9 | 0.0038° | 0.0001 dB | 4 samples (133 µs) |
+| 0–7.5 kHz (broadband/spike) | 13 *(default)* | 0.015° | 0.0015 dB | 6 samples (200 µs) |
+| 0–7.5 kHz | 33 | 0.0028° | 0.0004 dB | 16 samples (533 µs) |
+
+The requirement the default is chosen against is 0.05° of phase error and 0.01 dB
+of magnitude error over the intended passband — roughly three orders of magnitude
+below the ~81° of skew being corrected. 13 taps is the shortest odd length that
+holds that over the full broadband band (11 taps misses it at 0.09°), so it is
+the default. Drop to 7 in an LFP-only pipeline to halve the latency again; 33
+was the previous default and still works, but buys accuracy that is already far
+below the noise floor at three times the latency.
+
+### Performance
+
+The transformer runs once per message, so per-message cost at live chunk sizes —
+tens of samples, not thousands — is what matters. The portable Array-API
+implementation (the per-tap multiply-add loop and a log-depth rail scan) runs on
+any backend; two optional fast paths sit on top of it:
+
+- **MLX.** The FIR is evaluated as a single depthwise convolution (one group per
+  channel, kernel laid out once at state reset) rather than one dispatched
+  multiply-add per tap — about 2–3× faster per message and roughly flat from 3
+  to 1000 samples. The rail forward-fill's running max uses `mx.cummax`.
+- **numpy, with the optional `accel` extra (`pip install ezmsg-blackrock[accel]`,
+  which pulls in `numba`).** Both the FIR and the rail forward-fill run as fused
+  single-pass JIT-compiled kernels — roughly 3× faster than the tap loop at live
+  chunk sizes, and, via a threaded variant that engages automatically for large
+  buffers, an order of magnitude faster for offline batch processing of whole
+  recordings. Without the extra, numpy uses the portable path (the rail scan
+  taking the `maximum.accumulate` one-pass form), so nothing here is required.
+
+`examples/bench_sampling_delay_alignment.py` reports all of this across channel
+counts, message sizes, rail handling on/off, and fast-path versus portable.
+
 A few things to keep in mind:
 
 - **Latency.** The causal FIR adds a common bulk delay of `(filter_len-1)//2`

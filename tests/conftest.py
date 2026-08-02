@@ -14,7 +14,9 @@ import sys
 import time
 import zipfile
 from contextlib import contextmanager
+from http.client import HTTPException
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.request import urlretrieve
 
 import numpy as np
@@ -54,13 +56,41 @@ def _nplay_asset_name() -> str | None:
     return None
 
 
+DOWNLOAD_ATTEMPTS = 4
+
+
+def _retryable(exc: Exception) -> bool:
+    """Whether another attempt could plausibly succeed. A 4xx (asset renamed,
+    release deleted) will not fix itself; anything else is treated as transient."""
+    return exc.code >= 500 if isinstance(exc, HTTPError) else True
+
+
 def _download(url: str, dest: Path) -> None:
-    """Download url to dest, skipping if dest already exists."""
+    """Download url to dest, skipping if dest already exists.
+
+    GitHub's release-asset CDN serves the occasional 5xx and every matrix job
+    fetches these fresh, so a single blip would fail an otherwise good run:
+    retry with backoff. Each attempt lands on a temp path and is renamed into
+    place, so an interrupted download can't leave a truncated file behind that
+    the next run would treat as cached.
+    """
     if dest.exists():
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
     print(f"Downloading {url}")
-    urlretrieve(url, dest)
+    tmp = dest.with_name(dest.name + ".part")
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            urlretrieve(url, tmp)
+            tmp.replace(dest)
+            return
+        except (URLError, HTTPException, TimeoutError, ConnectionError) as exc:
+            tmp.unlink(missing_ok=True)
+            if attempt == DOWNLOAD_ATTEMPTS or not _retryable(exc):
+                raise
+            delay = 2**attempt
+            print(f"  attempt {attempt}/{DOWNLOAD_ATTEMPTS} failed ({exc}); retrying in {delay}s")
+            time.sleep(delay)
 
 
 def _extract_zip(zip_path: Path, dest_dir: Path) -> None:

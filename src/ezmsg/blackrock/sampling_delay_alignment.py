@@ -38,11 +38,21 @@ Cost / caveats:
 
 Array-API compatible: it detects the input's namespace and runs on the working
 backend (numpy, MLX, torch, jax, cupy, ...). The sinc taps are designed in numpy
-and moved to the backend; everything else -- the FIR tap-sum, concat/state
-handling, and the rail forward-fill -- runs on the backend using only standard
-Array-API ops (the forward-fill's cumulative max is built from ``maximum`` +
-shifts, since the standard lacks one). Only the MLX ``concatenate``-vs-``concat``
-spelling is special-cased.
+and moved to the backend; everything else -- the FIR, concat/state handling, and
+the rail forward-fill -- runs on the backend using only standard Array-API ops
+(the forward-fill's cumulative max is built from ``maximum`` + shifts, since the
+standard lacks one). Only MLX's ``concatenate``-vs-``concat`` spelling needs
+special-casing.
+
+Two backend-specific fast paths sit on top of that, because live acquisition
+delivers chunks of a few dozen samples where per-operation dispatch, not
+arithmetic, sets the wall time:
+  * on MLX the FIR runs as a single depthwise ``conv_general`` (one group per
+    column, kernel cached at state reset) instead of ``filter_len`` multiply-add
+    stages -- ~2-3x less time per message, and roughly flat in chunk size;
+  * the forward-fill's running max uses ``mx.cummax`` on MLX and the ``maximum``
+    ufunc's ``accumulate`` on numpy/cupy, in place of the log-depth scan.
+Both fall back to the portable formulation wherever those ops are missing.
 """
 
 from typing import Any
@@ -97,11 +107,28 @@ class SamplingDelayAlignmentSettings(ez.Settings):
     channel_sample_interval: float = _DEFAULT_CHANNEL_SAMPLE_INTERVAL
     """Seconds between successive channels within a bank."""
 
-    filter_len: int = 33
+    filter_len: int = 13
     """Sinc FIR length (odd). Bulk delay is ``(filter_len-1)//2`` samples; longer
     = flatter passband / better near Nyquist, at more latency and compute. Set to
     ``0`` to disable alignment entirely -- the transformer becomes a pass-through
-    that returns its input unchanged."""
+    that returns its input unchanged.
+
+    Worst case over all ``bank_size`` fractional delays, at 30 kHz (see
+    ``tests/test_sampling_delay_alignment.py`` for the pinned numbers):
+
+    ==========  ==========  ===============  =============  ==========
+    Passband    filter_len  Max phase error  Max mag error  Bulk delay
+    ==========  ==========  ===============  =============  ==========
+    0-500 Hz    7           0.0009 deg       0.00001 dB     3 samples
+    0-3 kHz     9           0.0038 deg       0.0001 dB      4 samples
+    0-7.5 kHz   13          0.015 deg        0.0015 dB      6 samples
+    0-7.5 kHz   33          0.0028 deg       0.0004 dB      16 samples
+    ==========  ==========  ===============  =============  ==========
+
+    The default 13 covers the full broadband/spike band with ~3 orders of
+    magnitude of margin on the ~81 deg of skew it is correcting, at less than
+    half the latency of the former 33-tap default. Use 7 in an LFP-only
+    pipeline; 33 buys accuracy that is already far below the noise floor."""
 
     rail_threshold: float | None = None
     """If set, samples with ``abs(value) >= rail_threshold`` are treated as
@@ -115,6 +142,12 @@ class SamplingDelayAlignmentState:
 
     fir: npt.NDArray | None = None
     """Per-channel sinc FIR taps, shape ``(filter_len, n_ch)``."""
+
+    conv_w: Any | None = None
+    """MLX depthwise-conv kernel, shape ``(n_cols, filter_len, 1)`` -- the same
+    taps as :attr:`fir`, reversed and laid out per flattened sample column.
+    ``None`` on every other backend (and when the taps don't broadcast over
+    ``sample_shape``), which selects the portable tap-sum instead."""
 
     hist: npt.NDArray | None = None
     """Carried input history, shape ``(filter_len-1, *sample_shape)``."""
@@ -195,34 +228,69 @@ class SamplingDelayAlignmentTransformer(
         if is_mlx:
             self._state.fir = _mx.array(h.astype(np.float32))
             self._state.hist = _mx.zeros((n_taps - 1,) + sample_shape, dtype=dtype)
+            self._state.conv_w = self._mlx_conv_weight(h, sample_shape, dtype)
         else:
             # h is numpy; convert to the backend then to its dtype (dtype may be
             # a non-numpy dtype, e.g. torch.float32, that numpy.astype rejects).
             self._state.fir = xp.astype(xp.asarray(h), dtype)
             self._state.hist = xp.zeros((n_taps - 1,) + sample_shape, dtype=dtype)
+            self._state.conv_w = None
+
+    @staticmethod
+    def _mlx_conv_weight(h: npt.NDArray, sample_shape: tuple[int, ...], dtype: Any) -> Any:
+        """Lay the designed taps out as an MLX depthwise-conv kernel, once.
+
+        ``mx.conv_general`` cross-correlates over one group per input column, so
+        the kernel is the per-column taps reversed, shaped ``(n_cols, n_taps, 1)``
+        with ``n_cols = prod(sample_shape)`` in the same row-major order
+        ``_process`` flattens the data. Returns ``None`` (keep the tap-sum) when
+        the per-channel taps don't broadcast over ``sample_shape``.
+        """
+        n_taps, n_ch = h.shape
+        if not sample_shape or sample_shape[-1] != n_ch:
+            return None
+        cols = np.broadcast_to(
+            h.reshape((n_taps,) + (1,) * (len(sample_shape) - 1) + (n_ch,)),
+            (n_taps,) + tuple(sample_shape),
+        ).reshape(n_taps, -1)
+        w = np.ascontiguousarray(cols[::-1].T, dtype=np.float32)[:, :, None]
+        # conv_general needs input and kernel in one dtype; use the dtype the
+        # tap-sum's float32-taps-times-data product would have promoted to.
+        out_dtype = (_mx.zeros(1, dtype=dtype) * _mx.zeros(1, dtype=_mx.float32)).dtype
+        return _mx.array(w).astype(out_dtype)
 
     @staticmethod
     def _fill_rails(x: npt.NDArray, thresh: float, xp: Any, is_mlx: bool) -> npt.NDArray:
         """Forward-fill (hold last valid) over railed samples, per channel.
 
         Backend-portable: per (time, channel), find the index of the most recent
-        valid sample at or before each position, then gather. Because the
-        Array-API standard lacks a cumulative max, it is built from standard ops
-        (``maximum`` + shifts) as a Hillis-Steele scan -- valid positions carry
-        their (increasing) index and railed ones carry ``-1``, so the running
-        max is exactly the last valid index. O(n log n) but fully vectorized,
-        and only runs when ``rail_threshold`` is set.
+        valid sample at or before each position, then gather -- valid positions
+        carry their (increasing) index and railed ones carry ``-1``, so a running
+        max over time is exactly the last valid index.
+
+        The Array-API standard has no cumulative max, so the running max is built
+        from ``maximum`` + shifts as a Hillis-Steele scan: O(n log n) backend
+        calls, fully vectorized, and correct everywhere. It is also the dominant
+        per-message cost once the FIR is fast, so backends that can do the scan
+        in one pass take it -- ``cummax`` on MLX, the ``maximum`` ufunc's
+        ``accumulate`` on numpy/cupy. Only runs when ``rail_threshold`` is set.
         """
         n = x.shape[0]
         sample_shape = x.shape[1:]
         ar = xp.reshape(xp.arange(n), (n,) + (1,) * (x.ndim - 1))
         idx = xp.where(xp.abs(x) >= thresh, -1, ar)  # index, or -1 where railed
-        shift = 1
-        while shift < n:
-            sentinel = xp.full((shift,) + sample_shape, -1, dtype=idx.dtype)
-            shifted = _concat(xp, is_mlx, [sentinel, idx[: n - shift]], axis=0)
-            idx = xp.maximum(idx, shifted)
-            shift *= 2
+        accumulate = None if is_mlx else getattr(xp.maximum, "accumulate", None)
+        if is_mlx:
+            idx = _mx.cummax(idx, axis=0)
+        elif accumulate is not None:
+            idx = accumulate(idx, axis=0)  # numpy/cupy ufunc: one pass
+        else:
+            shift = 1
+            while shift < n:
+                sentinel = xp.full((shift,) + sample_shape, -1, dtype=idx.dtype)
+                shifted = _concat(xp, is_mlx, [sentinel, idx[: n - shift]], axis=0)
+                idx = xp.maximum(idx, shifted)
+                shift *= 2
         idx = xp.where(idx < 0, 0, idx)  # leading rails -> first sample
         return xp.take_along_axis(x, idx, axis=0)
 
@@ -244,13 +312,22 @@ class SamplingDelayAlignmentTransformer(
         n_taps = fir.shape[0]
         n = x.shape[0]
 
-        # FIR via tap-sum, carrying n_taps-1 samples of history across chunks:
+        # FIR, carrying n_taps-1 samples of history across chunks:
         #   y[i] = sum_k fir[k] * xext[(n_taps-1) - k + i],  xext = [hist, x]
         xext = _concat(xp, is_mlx, [st.hist, x], axis=0)
-        y = xp.zeros_like(x)
-        for k in range(n_taps):
-            y = y + fir[k] * xext[n_taps - 1 - k : n_taps - 1 - k + n]
-        st.hist = xext[-(n_taps - 1) :]
+        if st.conv_w is not None:
+            # Same sum as below, as one MLX depthwise conv (one group per column)
+            # rather than n_taps dispatched multiply-adds -- which is what costs
+            # on the short chunks live acquisition delivers.
+            n_cols = st.conv_w.shape[0]
+            xin = xext if xext.dtype == st.conv_w.dtype else xext.astype(st.conv_w.dtype)
+            y = _mx.conv_general(_mx.reshape(xin, (1, xext.shape[0], n_cols)), st.conv_w, groups=n_cols)
+            y = _mx.reshape(y, (n,) + x.shape[1:])
+        else:
+            y = xp.zeros_like(x)
+            for k in range(n_taps):
+                y = y + fir[k] * xext[n_taps - 1 - k : n_taps - 1 - k + n]
+        st.hist = xext[xext.shape[0] - (n_taps - 1) :]
 
         if moved:
             y = xp.moveaxis(y, 0, ax_idx)

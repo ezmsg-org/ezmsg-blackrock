@@ -9,6 +9,9 @@ Pins the three properties that make it useful:
   at high frequency, where un-aligned CAR fails.
 * **Rail handling** -- with ``rail_threshold`` set, a clipped run is held rather
   than rung through the filter, keeping the output bounded.
+* **Response** -- every within-bank slot's filter meets an explicit phase and
+  magnitude tolerance over its documented passband, which is what justifies the
+  default ``filter_len``.
 """
 
 from __future__ import annotations
@@ -223,4 +226,182 @@ def test_array_api_backend_matches_numpy(backend):
     y_backend = np.concatenate(outs, axis=0)
 
     assert isinstance(last, arr_type)
-    np.testing.assert_allclose(y_backend, y_np, rtol=0, atol=1e-5)
+    # Explicit float32 tolerance: MLX evaluates the FIR as a depthwise
+    # convolution rather than a tap-sum, so it accumulates in a different order
+    # than numpy. On the held-rail samples (~1e4) that shows up as ~2e-3
+    # absolute -- 1.8e-7 relative, i.e. float32 eps, not a behavior difference.
+    np.testing.assert_allclose(y_backend, y_np, rtol=1e-6, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Fractional-delay response: what sets the default filter_len
+# ---------------------------------------------------------------------------
+
+# The alignment exists to remove up to ~81 deg of cross-channel skew at 7.5 kHz.
+# Residual error three orders of magnitude below that is well past the point of
+# diminishing returns, so the requirement for a usable filter_len is: over the
+# intended passband, across every within-bank slot, at most 0.05 deg of phase
+# error and 0.01 dB of magnitude error.
+MAX_PHASE_ERR_DEG = 0.05
+MAX_MAG_ERR_DB = 0.01
+
+
+def _response_error(filter_len: int, band_hi: float) -> tuple[float, float]:
+    """Worst-case (phase error in degrees, magnitude error in dB) over
+    ``0..band_hi``, across all ``BANK`` slots, for the filters the transformer
+    actually designs -- read back from its state, not re-derived here."""
+    proc = sampling_delay_alignment(filter_len=filter_len)
+    proc(_aa(np.zeros((filter_len + 1, BANK), dtype=np.float32)))
+    h = proc.state.fir  # (filter_len, BANK)
+    m = proc.state.bulk_delay
+
+    w = 2 * np.pi * np.linspace(0.0, band_hi, 2001) / FS
+    resp = np.exp(-1j * w[:, None] * np.arange(filter_len)[None, :]) @ h
+    ideal_delay = m + np.arange(BANK) * INTERVAL * FS  # bulk + per-slot fraction
+    ideal = np.exp(-1j * w[:, None] * ideal_delay[None, :])
+    phase_deg = np.abs(np.angle(resp * np.conj(ideal))) * 180.0 / np.pi
+    mag_db = np.abs(20.0 * np.log10(np.abs(resp)))
+    return float(phase_deg.max()), float(mag_db.max())
+
+
+@pytest.mark.parametrize(
+    ("filter_len", "band_hi"),
+    [
+        (7, 500.0),  # LFP-only pipelines
+        (9, 3000.0),
+        (13, 7500.0),  # the default: full broadband/spike band
+        (33, 7500.0),  # the former default, still supported
+    ],
+)
+def test_filter_response_meets_tolerance(filter_len, band_hi):
+    """Each documented (filter_len, passband) pair holds the tolerance for every
+    within-bank slot -- this is the table in the ``filter_len`` docstring."""
+    phase_deg, mag_db = _response_error(filter_len, band_hi)
+    assert phase_deg < MAX_PHASE_ERR_DEG
+    assert mag_db < MAX_MAG_ERR_DB
+
+
+def test_default_filter_len_is_the_shortest_that_covers_the_spike_band():
+    """13 is the default because it is the shortest odd length meeting the
+    broadband tolerance -- 11 misses it, so the latency can't be cut further."""
+    assert SamplingDelayAlignmentSettings().filter_len == 13
+    phase_deg, _ = _response_error(11, 7500.0)
+    assert phase_deg > MAX_PHASE_ERR_DEG
+
+
+def test_filter_len_one_is_unity_gain_and_carries_no_history():
+    """A single tap normalizes to 1, so it passes the input through with no bulk
+    delay -- and, unlike a longer filter, carries no inter-chunk history."""
+    proc = sampling_delay_alignment(filter_len=1)
+    x = np.random.default_rng(8).standard_normal((64, 32)).astype(np.float32)
+    out = proc(_aa(x, offset=1.0))
+    np.testing.assert_allclose(out.data, x, rtol=1e-6, atol=1e-6)
+    assert out.axes["time"].offset == pytest.approx(1.0)
+    assert proc.state.hist.shape[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Rail forward-fill: the one-pass and portable-scan formulations must agree
+# ---------------------------------------------------------------------------
+
+
+class _NoAccumulateNamespace:
+    """numpy, but with ``maximum`` as a plain binary function.
+
+    numpy, cupy and MLX all have a one-pass running max; torch and jax reach the
+    portable Hillis-Steele scan instead. Hiding ``maximum.accumulate`` selects
+    that scan so it stays covered without those backends installed.
+    """
+
+    maximum = staticmethod(lambda a, b: np.maximum(a, b))
+
+    def __getattr__(self, name):
+        return getattr(np, name)
+
+
+def test_rail_fill_scan_matches_one_pass():
+    """The portable scan and the one-pass running max hold the same samples."""
+    fill = SamplingDelayAlignmentTransformer._fill_rails
+    x = np.random.default_rng(11).standard_normal((257, 8)).astype(np.float32)
+    x[0:2, 0] = 1e4  # leading rail: nothing valid to hold yet
+    x[100:130, 3] = 1e4  # a long run
+    x[-1, 7] = 1e4  # trailing rail
+
+    one_pass = fill(x, 8000.0, np, False)
+    scan = fill(x, 8000.0, _NoAccumulateNamespace(), False)
+    np.testing.assert_array_equal(one_pass, scan)
+
+    # ...and both hold the last valid value, falling back to the first sample
+    # when a channel rails before any valid sample has been seen.
+    assert np.all(one_pass[0:2, 0] == x[0, 0])
+    assert np.all(one_pass[100:130, 3] == x[99, 3])
+    assert one_pass[-1, 7] == x[-2, 7]
+
+
+# ---------------------------------------------------------------------------
+# MLX fast path
+# ---------------------------------------------------------------------------
+
+
+def test_mlx_conv_path_matches_tap_loop(monkeypatch):
+    """The MLX depthwise-conv FIR reproduces the portable tap-sum (to float32),
+    is chunk-invariant, keeps its kernel and history on-device, and builds the
+    kernel once."""
+    mx = pytest.importorskip("mlx.core")
+    n, nch = 2000, 64
+    x = np.random.default_rng(9).standard_normal((n, nch)).astype(np.float32)
+    x[500:503, 7] = 1e4  # exercise the cummax rail fill on the same path
+    chunks = [3, 30, 300, 1000, 667]
+    assert sum(chunks) == n
+
+    def run(proc, sizes=chunks):
+        outs, start = [], 0
+        for size in sizes:
+            msg = AxisArray(
+                data=mx.array(x[start : start + size]),
+                dims=["time", "ch"],
+                axes={"time": LinearAxis(offset=start / FS, gain=1.0 / FS)},
+                key="align",
+            )
+            outs.append(np.array(proc(msg).data))
+            start += size
+        return np.concatenate(outs, axis=0)
+
+    conv_proc = sampling_delay_alignment(rail_threshold=8000.0)
+    y_conv = run(conv_proc)
+    y_whole = run(sampling_delay_alignment(rail_threshold=8000.0), sizes=[n])
+    np.testing.assert_allclose(y_conv, y_whole, rtol=1e-6, atol=1e-5)
+
+    # Same transformer with the cached kernel suppressed -> the tap-sum fallback.
+    monkeypatch.setattr(
+        SamplingDelayAlignmentTransformer,
+        "_mlx_conv_weight",
+        staticmethod(lambda *args: None),
+    )
+    loop_proc = sampling_delay_alignment(rail_threshold=8000.0)
+    y_loop = run(loop_proc)
+
+    assert loop_proc.state.conv_w is None
+    assert isinstance(conv_proc.state.conv_w, mx.array)
+    assert isinstance(conv_proc.state.hist, mx.array)
+    np.testing.assert_allclose(y_conv, y_loop, rtol=1e-6, atol=1e-5)
+
+
+def test_mlx_conv_weight_is_built_once_per_state():
+    """The kernel layout is cached at state reset, not rebuilt per message."""
+    mx = pytest.importorskip("mlx.core")
+    proc = sampling_delay_alignment()
+    x = np.random.default_rng(10).standard_normal((300, 32)).astype(np.float32)
+
+    def msg(start, size):
+        return AxisArray(
+            data=mx.array(x[start : start + size]),
+            dims=["time", "ch"],
+            axes={"time": LinearAxis(offset=start / FS, gain=1.0 / FS)},
+            key="align",
+        )
+
+    proc(msg(0, 100))
+    w = proc.state.conv_w
+    proc(msg(100, 50))  # a different chunk length must not trigger a rebuild
+    assert proc.state.conv_w is w

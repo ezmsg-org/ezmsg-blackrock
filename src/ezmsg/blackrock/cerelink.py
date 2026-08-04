@@ -303,9 +303,8 @@ class _CereLinkBaseProducer(
 
     async def _open_and_configure(self) -> None:
         loop = asyncio.get_running_loop()
-        self.state.session = Session(device_type=self.settings.device_type)
+        self.state.session = await asyncio.to_thread(Session, device_type=self.settings.device_type)
         try:
-            await asyncio.to_thread(self.state.session.__enter__)
             await self.state.session.wait_until_running(timeout=10.0)
             await asyncio.to_thread(self._apply_configure)
             await asyncio.to_thread(self._apply_channel_maps)

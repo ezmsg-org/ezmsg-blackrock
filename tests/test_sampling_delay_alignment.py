@@ -486,3 +486,31 @@ def test_numba_weight_absent_without_numba(_no_numba):
     out = proc(_aa(x))
     assert proc.state.nb_w is None
     assert out.data.shape == x.shape
+
+
+def test_numba_rail_fill_parallel_blocks_match_portable():
+    """The threaded forward-fill splits over *column blocks*, so each block must
+    seed its own ``last_valid`` from row 0 of its own columns.
+
+    Exercised with a rail run straddling a block boundary and a leading rail in
+    a column that is not in block 0 -- the two ways a per-block seed can go
+    wrong (holding a neighbour's value, or falling back to the wrong row)."""
+    nb = pytest.importorskip("ezmsg.blackrock._numba_kernels")
+    n = nb.PARALLEL_MIN_SAMPLES + 137  # over the threshold -> parallel kernel
+    n_cols = 200
+    x = np.random.default_rng(24).standard_normal((n, n_cols)).astype(np.float32)
+
+    block = max(nb.MIN_PARALLEL_BLOCK, -(-n_cols // nb.get_num_threads()))
+    assert n_cols > block, "test needs more than one column block"
+    x[100:160, block - 1 : block + 1] = 1e4  # run straddling a block boundary
+    x[0:3, n_cols - 1] = 1e4  # leading rail in the last block
+    x[-1, block] = 1e4  # trailing rail at a block start
+
+    out = np.empty_like(x)
+    nb.fill_rails(x, 8000.0, out)
+    portable = SamplingDelayAlignmentTransformer._fill_rails(x, 8000.0, _NoAccumulateNamespace(), False)
+    np.testing.assert_array_equal(out, portable)
+
+    # ...and the block seed is the column's own first sample, not a neighbour's.
+    assert np.all(out[0:3, n_cols - 1] == x[0, n_cols - 1])
+    assert np.all(out[100:160, block] == x[99, block])

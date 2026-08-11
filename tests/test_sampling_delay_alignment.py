@@ -16,6 +16,8 @@ Pins the three properties that make it useful:
 
 from __future__ import annotations
 
+import gc
+
 import numpy as np
 import pytest
 from ezmsg.util.messages.axisarray import AxisArray, CoordinateAxis, LinearAxis
@@ -486,6 +488,102 @@ def test_numba_weight_absent_without_numba(_no_numba):
     out = proc(_aa(x))
     assert proc.state.nb_w is None
     assert out.data.shape == x.shape
+
+
+def test_numba_buffer_is_reused_and_hist_views_it():
+    """The numba path runs out of one reused ``[history, chunk]`` buffer: a
+    message that fits reallocates nothing, ``hist`` is a view of the buffer's
+    leading rows (not of a per-message temporary), and outgrowing it grows the
+    buffer geometrically rather than refitting to every new chunk size."""
+    pytest.importorskip("ezmsg.blackrock._numba_kernels")
+    hist_len, nch = 12, 32  # filter_len - 1
+    proc = sampling_delay_alignment(rail_threshold=8000.0)
+    x = np.random.default_rng(25).standard_normal((900, nch)).astype(np.float32)
+
+    proc(_aa(x[:300]))
+    assert proc.state.nb_w is not None
+    buf = proc.state.scratch
+    assert buf.shape == (hist_len + 300, nch)
+    assert proc.state.hist.shape == (hist_len, nch)
+    assert np.shares_memory(proc.state.hist, buf)
+
+    proc(_aa(x[300:500], offset=300 / FS))  # fits -> reuse, no allocation
+    assert proc.state.scratch is buf
+
+    proc(_aa(x[500:900], offset=500 / FS))  # outgrows it -> 2x, not a refit
+    grown = proc.state.scratch
+    assert grown is not buf
+    assert grown.shape == (hist_len + 600, nch)
+    assert np.shares_memory(proc.state.hist, grown)
+
+    # A shape change resets the state, so the buffer must not be carried over.
+    proc(_aa(np.zeros((64, nch // 2), dtype=np.float32)))
+    assert proc.state.scratch.shape == (hist_len + 64, nch // 2)
+
+
+def test_numba_history_roll_survives_chunks_shorter_than_the_history(_no_numba):
+    """Carrying the history inside the buffer means rolling its tail to the
+    front, and those two row ranges overlap whenever a chunk is shorter than the
+    history (``n < filter_len - 1``) -- the regime a live source sits in when it
+    is keeping up. Streaming such chunks must still match the whole-buffer
+    result, across a grow-then-shrink sequence that also reuses a buffer sized
+    for a much larger chunk."""
+    nb = pytest.importorskip("ezmsg.blackrock._numba_kernels")
+    assert sda._nb is None  # fixture applied; recompute the portable reference
+    chunks = [1, 2, 5, 11, 12] + [7] * 60 + [150] + [1] * 10 + [3]
+    n, nch = sum(chunks), 24
+    x = np.random.default_rng(26).standard_normal((n, nch)).astype(np.float32)
+    x[200:206, 5] = 1e4  # a railed run, so the fill writes into the buffer too
+    y_portable = _stream(sampling_delay_alignment(rail_threshold=8000.0), x, [n])
+
+    sda._nb = nb
+    proc = sampling_delay_alignment(rail_threshold=8000.0)
+    y_numba = _stream(proc, x, chunks)
+
+    assert proc.state.nb_w is not None
+    np.testing.assert_allclose(y_numba, y_portable, rtol=1e-6, atol=1e-5)
+
+
+def test_hist_owns_its_memory_on_the_portable_path(_no_numba):
+    """The portable path copies the carried history out of the concatenated
+    buffer. Keeping the slice would pin that whole ``(n + filter_len - 1,
+    n_cols)`` temporary -- 312 KiB holding 12 KiB of history here -- for as long
+    as the state lives, and keep the allocator from reusing it."""
+    proc = sampling_delay_alignment()
+    x = np.random.default_rng(27).standard_normal((300, 256)).astype(np.float32)
+    proc(_aa(x))
+
+    assert proc.state.nb_w is None  # fixture applied: this is the portable path
+    assert proc.state.hist.shape == (12, 256)
+    assert proc.state.hist.base is None  # owns its memory; retains nothing else
+
+
+def test_mlx_hist_does_not_retain_the_concat_buffer():
+    """Same fix on MLX, where slicing also pins its base: after one large
+    message the state must hold kilobytes of history, not the megabytes of the
+    buffer it was sliced from."""
+    mx = pytest.importorskip("mlx.core")
+    n, nch = 20000, 256  # ~20 MB per full-chunk buffer, vs ~12 KiB of history
+    x = np.random.default_rng(28).standard_normal((n, nch)).astype(np.float32)
+    proc = sampling_delay_alignment()
+
+    msg = AxisArray(
+        data=mx.array(x),
+        dims=["time", "ch"],
+        axes={"time": LinearAxis(offset=0.0, gain=1.0 / FS)},
+        key="align",
+    )
+    del x
+    out = proc(msg)
+    mx.eval(out.data, proc.state.hist)
+    del msg, out
+    gc.collect()
+    mx.clear_cache()
+    mx.synchronize()
+
+    assert proc.state.hist.shape == (12, nch)
+    # Generous threshold: the leak under test is ~20 MB, the taps are ~100 KiB.
+    assert mx.get_active_memory() < 4e6
 
 
 def test_numba_rail_fill_parallel_blocks_match_portable():

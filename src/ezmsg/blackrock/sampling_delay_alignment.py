@@ -54,7 +54,9 @@ arithmetic, sets the wall time:
     and the rail forward-fill run as fused single-pass jitted kernels (see
     :mod:`ezmsg.blackrock._numba_kernels`): several times faster than the tap
     loop at live sizes and, with a threaded FIR for large buffers, ~20x faster
-    for offline batch processing;
+    for offline batch processing. That path also runs out of one reused
+    ``[history, chunk]`` buffer rather than concatenating the history onto each
+    message, so a steady stream allocates only its output;
   * the forward-fill's running max otherwise uses ``mx.cummax`` on MLX and the
     ``maximum`` ufunc's ``accumulate`` on numpy/cupy, in place of the log scan.
 All of these fall back to the portable formulation wherever the op or the
@@ -107,6 +109,20 @@ def _namespace(arr: object) -> tuple[Any, bool]:
 def _concat(xp: Any, is_mlx: bool, arrays: list, axis: int = 0) -> Any:
     """Concatenate (MLX spells it ``concatenate``; Array-API uses ``concat``)."""
     return _mx.concatenate(arrays, axis=axis) if is_mlx else xp.concat(arrays, axis=axis)
+
+
+def _own(xp: Any, is_mlx: bool, arr: Any) -> Any:
+    """Return a copy of ``arr`` that owns its memory.
+
+    For a slice kept across messages: on every backend here -- numpy, torch,
+    cupy and MLX alike -- slicing returns a view that pins its *base* buffer
+    alive, so retaining a small tail of a large temporary retains the whole
+    temporary (measured: MLX holds 25.6 MB for a 12-row tail; numpy holds a
+    312 KiB concat buffer for 12 KiB of history at 300 samples x 256 channels).
+    Copying the tail costs far less than pinning the base, and frees the base
+    for the allocator to hand straight back for the next message's buffer.
+    """
+    return _mx.array(arr) if is_mlx else xp.asarray(arr, copy=True)
 
 
 _DEFAULT_BANK_SIZE = 32
@@ -173,7 +189,15 @@ class SamplingDelayAlignmentState:
     otherwise, which selects the portable tap-sum."""
 
     hist: npt.NDArray | None = None
-    """Carried input history, shape ``(filter_len-1, *sample_shape)``."""
+    """Carried input history, shape ``(filter_len-1, *sample_shape)``. On the
+    numba path this is a view of the leading rows of :attr:`scratch`; elsewhere
+    it owns its memory (see :func:`_own`)."""
+
+    scratch: npt.NDArray | None = None
+    """numba path only: the reused ``(filter_len-1 + capacity, n_cols)`` work
+    buffer holding the carried history followed by the current chunk, so the
+    per-message concat and its full-chunk temporary don't happen. Grown (never
+    shrunk) to the largest chunk seen; ``None`` until the first message."""
 
     bulk_delay: int = 0
     """Common bulk delay ``(filter_len-1)//2`` samples (for the offset shift)."""
@@ -242,6 +266,9 @@ class SamplingDelayAlignmentTransformer(
         n_taps = int(self.settings.filter_len)
         m = (n_taps - 1) // 2
         self._state.bulk_delay = m
+        # The state object survives a reset, so the old buffer (sized for the
+        # previous shape/dtype) has to be dropped explicitly.
+        self._state.scratch = None
 
         # Design the per-channel windowed sinc in numpy (total delay m + d_c, DC
         # gain 1), then move the taps onto the working backend.
@@ -314,6 +341,11 @@ class SamplingDelayAlignmentTransformer(
         available -- a fused single left-to-right pass in numba (numpy + accel
         extra), else ``cummax`` on MLX and the ``maximum`` ufunc's ``accumulate``
         on numpy/cupy. Only runs when ``rail_threshold`` is set.
+
+        :meth:`_numba_filter` doesn't come through here -- it runs the same
+        jitted fill straight into its shared buffer. The numba branch below
+        still covers numpy inputs whose taps don't broadcast over the sample
+        shape, which leaves ``nb_w`` (and so that path) unavailable.
         """
         if _use_numba(x):
             flat = np.ascontiguousarray(x).reshape(x.shape[0], -1)
@@ -339,6 +371,60 @@ class SamplingDelayAlignmentTransformer(
         idx = xp.where(idx < 0, 0, idx)  # leading rails -> first sample
         return xp.take_along_axis(x, idx, axis=0)
 
+    def _scratch(self, n: int, sample_shape: tuple[int, ...], dtype: Any) -> npt.NDArray:
+        """The ``[history, chunk]`` work buffer, with room for ``n`` new samples.
+
+        Reallocated only when a chunk outgrows it, and then geometrically: live
+        acquisition chunk sizes drift with the backlog, and refitting exactly
+        would put an allocation back on the hot path for every small increase.
+        The carried history moves into the new buffer, and :attr:`state.hist`
+        re-points at it -- a view of a buffer the state means to keep, not of a
+        per-message temporary.
+        """
+        st = self._state
+        h = st.nb_w.shape[0] - 1
+        n_cols = st.nb_w.shape[1]
+        buf = st.scratch
+        if buf is None or buf.shape[0] - h < n:
+            capacity = 0 if buf is None else buf.shape[0] - h
+            buf = np.empty((h + max(n, 2 * capacity), n_cols), dtype=dtype)
+            buf[:h] = st.hist.reshape(h, n_cols)
+            st.scratch = buf
+            st.hist = buf[:h].reshape((h,) + sample_shape)
+        return buf
+
+    def _numba_filter(self, x: npt.NDArray, n: int) -> npt.NDArray:
+        """The numpy+numba path: rail forward-fill and FIR through :meth:`_scratch`.
+
+        The history the FIR needs is just the tail of the previous chunk, so
+        keeping one buffer with that history at the front lets the new chunk be
+        written in directly behind it -- no per-message concat, and no
+        full-chunk temporary to hold its result. With rail handling on there is
+        no extra copy at all, because the forward-fill writes its output into
+        that buffer instead of a second one. Only the FIR output is still
+        allocated per message, since it is what the message carries downstream.
+        """
+        st = self._state
+        sample_shape = x.shape[1:]
+        n_taps, n_cols = st.nb_w.shape
+        h = n_taps - 1
+        buf = self._scratch(n, sample_shape, x.dtype)
+
+        flat = np.ascontiguousarray(x).reshape(n, n_cols)
+        chunk = buf[h : h + n]
+        if self.settings.rail_threshold is not None:
+            _nb.fill_rails(flat, float(self.settings.rail_threshold), chunk)
+        else:
+            chunk[...] = flat
+
+        yflat = np.empty((n, n_cols), dtype=buf.dtype)
+        _nb.fir(buf[: h + n], st.nb_w, yflat)
+        # Carry the last h rows forward as the next message's history (st.hist
+        # views these rows). numpy takes a temporary when the two slices overlap,
+        # which they do for a chunk shorter than the history.
+        buf[:h] = buf[n : n + h]
+        return yflat.reshape((n,) + sample_shape)
+
     def _process(self, message: AxisArray) -> AxisArray:
         if self._passthrough:
             return message
@@ -349,37 +435,35 @@ class SamplingDelayAlignmentTransformer(
         if moved:
             x = xp.moveaxis(x, ax_idx, 0)
 
-        if self.settings.rail_threshold is not None:
-            x = self._fill_rails(x, self.settings.rail_threshold, xp, is_mlx)
-
         st = self._state
         fir = st.fir
         n_taps = fir.shape[0]
         n = x.shape[0]
 
-        # FIR, carrying n_taps-1 samples of history across chunks:
-        #   y[i] = sum_k fir[k] * xext[(n_taps-1) - k + i],  xext = [hist, x]
-        xext = _concat(xp, is_mlx, [st.hist, x], axis=0)
-        if st.conv_w is not None:
-            # Same sum as below, as one MLX depthwise conv (one group per column)
-            # rather than n_taps dispatched multiply-adds -- which is what costs
-            # on the short chunks live acquisition delivers.
-            n_cols = st.conv_w.shape[0]
-            xin = xext if xext.dtype == st.conv_w.dtype else xext.astype(st.conv_w.dtype)
-            y = _mx.conv_general(_mx.reshape(xin, (1, xext.shape[0], n_cols)), st.conv_w, groups=n_cols)
-            y = _mx.reshape(y, (n,) + x.shape[1:])
-        elif st.nb_w is not None:
-            # Same sum as one fused jitted pass over the flattened columns.
-            n_cols = st.nb_w.shape[1]
-            xin = np.ascontiguousarray(xext).reshape(xext.shape[0], n_cols)
-            yflat = np.empty((n, n_cols), dtype=xext.dtype)
-            _nb.fir(xin, st.nb_w, yflat)
-            y = yflat.reshape((n,) + x.shape[1:])
+        if st.nb_w is not None:
+            # Fused jitted passes over the flattened columns, sharing one
+            # preallocated buffer (which is also where the rail fill writes).
+            y = self._numba_filter(x, n)
         else:
-            y = xp.zeros_like(x)
-            for k in range(n_taps):
-                y = y + fir[k] * xext[n_taps - 1 - k : n_taps - 1 - k + n]
-        st.hist = xext[xext.shape[0] - (n_taps - 1) :]
+            if self.settings.rail_threshold is not None:
+                x = self._fill_rails(x, self.settings.rail_threshold, xp, is_mlx)
+
+            # FIR, carrying n_taps-1 samples of history across chunks:
+            #   y[i] = sum_k fir[k] * xext[(n_taps-1) - k + i],  xext = [hist, x]
+            xext = _concat(xp, is_mlx, [st.hist, x], axis=0)
+            if st.conv_w is not None:
+                # Same sum as below, as one MLX depthwise conv (one group per
+                # column) rather than n_taps dispatched multiply-adds -- which is
+                # what costs on the short chunks live acquisition delivers.
+                n_cols = st.conv_w.shape[0]
+                xin = xext if xext.dtype == st.conv_w.dtype else xext.astype(st.conv_w.dtype)
+                y = _mx.conv_general(_mx.reshape(xin, (1, xext.shape[0], n_cols)), st.conv_w, groups=n_cols)
+                y = _mx.reshape(y, (n,) + x.shape[1:])
+            else:
+                y = xp.zeros_like(x)
+                for k in range(n_taps):
+                    y = y + fir[k] * xext[n_taps - 1 - k : n_taps - 1 - k + n]
+            st.hist = _own(xp, is_mlx, xext[xext.shape[0] - (n_taps - 1) :])
 
         if moved:
             y = xp.moveaxis(y, 0, ax_idx)

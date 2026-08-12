@@ -612,3 +612,79 @@ def test_numba_rail_fill_parallel_blocks_match_portable():
     # ...and the block seed is the column's own first sample, not a neighbour's.
     assert np.all(out[0:3, n_cols - 1] == x[0, n_cols - 1])
     assert np.all(out[100:160, block] == x[99, block])
+
+
+# --- Kernel warmup ----------------------------------------------------------
+# The jitted kernels cost ~61 ms on their first execution in a process even with
+# the on-disk cache warm (object-code load, threading-layer init, type binding).
+# Paid on the first message of a live stream that is ~61 chunks of backlog, which
+# the transformer then publishes as a burst; paid at construction it is nothing.
+
+
+@pytest.mark.skipif(sda._nb is None, reason="numba not installed")
+def test_warmup_compiles_every_kernel():
+    """All four dispatchers, not just the ones live-sized chunks reach.
+
+    ``fir``/``fill_rails`` pick a serial or parallel kernel by buffer size, and
+    the pair a caller has not exercised yet is still cold. Live chunks are far
+    below PARALLEL_MIN_SAMPLES, so the parallel kernels would otherwise compile
+    on the first oversized buffer -- which is a backlog burst, exactly when the
+    stall is least affordable.
+    """
+    nbk = sda._nb
+    nbk.warmup()
+
+    for kernel in (
+        nbk._fir_serial,
+        nbk._fir_parallel,
+        nbk._fill_rails_serial,
+        nbk._fill_rails_parallel,
+    ):
+        assert kernel.signatures, f"{kernel.py_func.__name__} was left cold"
+
+
+@pytest.mark.skipif(sda._nb is None, reason="numba not installed")
+def test_warmup_is_idempotent(monkeypatch):
+    """Every transformer constructed in a process calls this; only one may work."""
+    nbk = sda._nb
+    nbk.warmup()
+
+    calls = []
+    monkeypatch.setattr(nbk, "_fir_serial", lambda *a: calls.append(a))
+    nbk.warmup()
+
+    assert calls == []
+
+
+@pytest.mark.skipif(sda._nb is None, reason="numba not installed")
+def test_warmup_failure_is_not_fatal(monkeypatch):
+    """Warming is an optimization; it must never take down a working unit."""
+    nbk = sda._nb
+
+    def explode(*_args):
+        raise RuntimeError("no compiler today")
+
+    monkeypatch.setattr(nbk, "_fir_serial", explode)
+    monkeypatch.setattr(nbk, "_WARMED", set())
+
+    nbk.warmup()  # must not raise
+
+
+@pytest.mark.skipif(sda._nb is None, reason="numba not installed")
+def test_transformer_warms_on_construction_not_on_first_message(monkeypatch):
+    """The point of the exercise: the cost lands before any data arrives."""
+    warmed = []
+    monkeypatch.setattr(sda._nb, "warmup", lambda *a, **k: warmed.append(True))
+
+    SamplingDelayAlignmentTransformer(settings=SamplingDelayAlignmentSettings(filter_len=13))
+    assert warmed, "an aligning transformer must warm its kernels at construction"
+
+
+@pytest.mark.skipif(sda._nb is None, reason="numba not installed")
+def test_passthrough_does_not_warm(monkeypatch):
+    """filter_len < 1 never reaches a kernel, so it must not pay for one."""
+    warmed = []
+    monkeypatch.setattr(sda._nb, "warmup", lambda *a, **k: warmed.append(True))
+
+    SamplingDelayAlignmentTransformer(settings=SamplingDelayAlignmentSettings(filter_len=0))
+    assert not warmed

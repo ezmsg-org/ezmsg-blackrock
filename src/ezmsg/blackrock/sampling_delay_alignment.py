@@ -217,6 +217,22 @@ class SamplingDelayAlignmentTransformer(
     # alter the designed filters, so changing it needn't reset the state.
     NONRESET_SETTINGS_FIELDS = frozenset({"rail_threshold"})
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Warm the jitted kernels here rather than letting the first message
+        # pay for them. A unit builds its transformer from initialize(), which
+        # runs in the hosting process before any message flows, so this is the
+        # last moment nothing is waiting: on a live source the same cost lands
+        # mid-stream, and every millisecond it takes is another chunk queued
+        # behind it (see _numba_kernels.warmup).
+        #
+        # Skipped when alignment is off, since a pass-through never reaches a
+        # kernel. Not skipped for a stream that turns out to be MLX or torch --
+        # the array type is not knowable until the first message, and paying a
+        # warmup those backends will not use is the cheaper mistake.
+        if _nb is not None and not self._passthrough:
+            _nb.warmup()
+
     @property
     def _passthrough(self) -> bool:
         """``filter_len <= 0`` disables alignment: the transformer returns its

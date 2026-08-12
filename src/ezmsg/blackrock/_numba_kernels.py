@@ -32,8 +32,13 @@ sample shape to columns (matching the MLX conv layout) and reshapes back.
 
 from __future__ import annotations
 
+import logging
+
+import numpy as np
 import numpy.typing as npt
 from numba import get_num_threads, njit, prange
+
+logger = logging.getLogger(__name__)
 
 # Below this many samples the parallel FIR's thread fork-join (~0.1 ms) costs
 # more than it saves, and -- more importantly -- spawning a thread pool per
@@ -140,3 +145,59 @@ def fill_rails(x: npt.NDArray, thresh: float, out: npt.NDArray) -> None:
         _fill_rails_parallel(x, thresh, out, block)
     else:
         _fill_rails_serial(x, thresh, out)
+
+
+_WARMED: set[tuple[str, bool]] = set()
+
+
+def warmup(dtype: npt.DTypeLike = np.float32, *, parallel: bool = True) -> None:
+    """Pay the jitted kernels' first-call cost now, off the data path.
+
+    ``cache=True`` above stores compiled code on disk, which is why a second
+    process pays far less than the first. What it cannot remove is what numba
+    still does on the first *execution* in every process: load that object
+    code, initialize the threading layer for the ``parallel=True`` kernels, and
+    bind the type specialization. Measured on a 256-channel hub at 30 kHz that
+    is ~61 ms, and it lands on the first message of a live stream -- which by
+    then has a message queued behind every millisecond it takes. The chunks
+    that backlog produces are then published in a burst, which is what makes a
+    one-time startup cost look like a throughput problem downstream.
+
+    Calling this once from a unit's construction moves the whole cost into
+    graph startup, where nothing is waiting on it. The dispatch is per (dtype,
+    kernel), so this warms the FIR and the rail fill in both their serial and
+    parallel forms; ``parallel=False`` skips the threaded pair for a caller
+    that will only ever see live-sized chunks (see
+    :data:`PARALLEL_MIN_SAMPLES`).
+
+    Only ``dtype`` is specialized here, but the expensive part is per process,
+    not per dtype: a stream that turns out to be float64 after a float32 warmup
+    pays well under a millisecond for the extra specialization.
+
+    Idempotent, and never raises: warming is an optimization, so a numba
+    failure here must not take down a unit that would otherwise have run.
+    """
+    key = (np.dtype(dtype).name, bool(parallel))
+    if key in _WARMED:
+        return
+    _WARMED.add(key)
+
+    try:
+        taps, n_cols = 2, 2
+        w = np.zeros((taps, n_cols), dtype=dtype)
+        out = np.zeros((1, n_cols), dtype=dtype)
+        xext = np.zeros((1 + taps - 1, n_cols), dtype=dtype)
+        rails_in = np.zeros((2, n_cols), dtype=dtype)
+        rails_out = np.zeros_like(rails_in)
+
+        # The private kernels directly, not fir()/fill_rails(): the wrappers
+        # dispatch on size, so reaching the parallel pair through them would
+        # mean allocating PARALLEL_MIN_SAMPLES rows to warm a kernel that does
+        # not care how many rows it is given.
+        _fir_serial(xext, w, out)
+        _fill_rails_serial(rails_in, 8191.0, rails_out)
+        if parallel:
+            _fir_parallel(xext, w, out)
+            _fill_rails_parallel(rails_in, 8191.0, rails_out, MIN_PARALLEL_BLOCK)
+    except Exception:  # pragma: no cover - warming must never be fatal
+        logger.debug("SDA numba kernel warmup failed; first call will pay it", exc_info=True)

@@ -207,6 +207,10 @@ class ChannelMapProcessor(BaseStatefulTransformer[ChannelMapUnitSettings, AxisAr
                 cmp_mask[idx] = True
 
         self.state.channel_axis = CoordinateAxis(data=ch_data, dims=["ch"], unit="struct")
+        # Primed here rather than by whoever hashes it first: this axis is reused
+        # for every message until the next CMP reload, and it crosses process
+        # boundaries, where a cold axis is re-checksummed on every message.
+        self.state.channel_axis.fingerprint
         self.state.cmp_mask = cmp_mask
         # CMP wins over source geometry: a CMP-claimed index is "placed" by the
         # overlay, not the source.

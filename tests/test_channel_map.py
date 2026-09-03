@@ -533,3 +533,37 @@ def test_auto_grid_array_mirrors_bank() -> None:
 
     for i in range(64):
         assert ch[i]["array"] == f"bank{ch[i]['bank']}"
+
+
+class TestTheChannelAxisIsHandedOverPrimed:
+    """``CoordinateAxis.fingerprint`` is cached on the axis and pickled with it.
+
+    The overlay builds one channel axis and reuses it for every message until the
+    next CMP reload, so computing the checksum here costs once per configuration.
+    Left cold it is computed by whoever hashes it first -- and since unpickling
+    builds a new axis object per message, that is the first consumer in *every*
+    receiving process, on *every* message.
+    """
+
+    def test_the_overlaid_axis_carries_its_fingerprint(self):
+        proc = _make_processor(CMP_FILE)
+        out = proc(_make_message(128))
+        assert "_fingerprint" in out.axes["ch"].__dict__
+        assert out.axes["ch"].fingerprint is not None
+
+    def test_it_survives_the_transport(self):
+        import pickle
+
+        proc = _make_processor(CMP_FILE)
+        out = proc(_make_message(128))
+        landed = pickle.loads(pickle.dumps(out))
+        assert "_fingerprint" in landed.axes["ch"].__dict__
+        assert landed.axes["ch"].__dict__["_fingerprint"] == out.axes["ch"].fingerprint
+
+    def test_a_reload_reprimes_rather_than_carrying_the_old_digest(self):
+        """A different mapping must not inherit the previous one's fingerprint."""
+        proc = _make_processor(CMP_FILE)
+        first = proc(_make_message(128)).axes["ch"].fingerprint
+        second = proc(_make_message(96)).axes["ch"]
+        assert "_fingerprint" in second.__dict__
+        assert second.fingerprint != first

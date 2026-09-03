@@ -11,7 +11,8 @@ dynamic = ["version"]
 dependencies = [
     "ezmsg-baseproc>=1.9.0",
     "ezmsg-event",
-    "ezmsg>=3.6.1",
+    # 3.10.0b2 for AxisArray.chunk_dim and CoordinateAxis.fingerprint.
+    "ezmsg>=3.10.0b2",
     "pycbsdk>=10.1.0",
     "scipy",
 ]

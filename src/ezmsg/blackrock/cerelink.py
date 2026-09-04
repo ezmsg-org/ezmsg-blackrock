@@ -502,11 +502,21 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
         ch_info = self._build_ch_info(channels)
         time_ax = AxisArray.TimeAxis(fs, offset=0.0)
         ch_ax = AxisArray.CoordinateAxis(data=ch_info, dims=["ch"], unit="struct")
+        # Compute the channel fingerprint once, now. It is cached on the axis and
+        # pickled with it, and every message reuses this same axis object, so one
+        # checksum here covers the whole subscription. Left cold it would be
+        # computed by the first stateful consumer in this process -- and, because
+        # unpickling builds a new axis object per message, by the first consumer
+        # in every other process, on every message, for the life of the stream.
+        ch_ax.fingerprint
         template = AxisArray(
             np.zeros((0, 0)),
             dims=["time", "ch"],
             axes={"time": time_ax, "ch": ch_ax},
             key=rate.name,
+            # Messages append along `time`; everything else describes the
+            # subscription. Consumers key their cached state on that distinction.
+            chunk_dim="time",
             attrs={
                 "unit": "uV" if self.settings.microvolts else "raw",
                 "manufacturer": "CereLink",
@@ -582,6 +592,7 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
             return
         ch_info = self._build_ch_info(channels)
         new_ch_ax = AxisArray.CoordinateAxis(data=ch_info, dims=["ch"], unit="struct")
+        new_ch_ax.fingerprint
         old = self.state.template
         self.state.template = replace(old, axes={**old.axes, "ch": new_ch_ax})
 
@@ -754,11 +765,15 @@ class CereLinkSpikeProducer(_CereLinkBaseProducer[CereLinkSpikeSettings, CereLin
         time_ax = AxisArray.TimeAxis(float(_SPIKE_FS), offset=0.0)
         ch_ax = AxisArray.CoordinateAxis(data=ch_info, dims=["ch"], unit="struct")
         unit_ax = AxisArray.CoordinateAxis(data=_UNIT_LABELS.copy(), dims=["unit"], unit="label")
+        # Primed once for the subscription -- see `_setup_subscription` above.
+        ch_ax.fingerprint
+        unit_ax.fingerprint
         template = AxisArray(
             np.zeros((0, 0, 0), dtype=np.uint8),
             dims=["time", "ch", "unit"],
             axes={"time": time_ax, "ch": ch_ax, "unit": unit_ax},
             key="SPIKES",
+            chunk_dim="time",
             attrs={
                 "unit": "count",
                 "manufacturer": "CereLink",
@@ -828,6 +843,7 @@ class CereLinkSpikeProducer(_CereLinkBaseProducer[CereLinkSpikeSettings, CereLin
         channels = sorted(st.chid_to_buffer_idx, key=st.chid_to_buffer_idx.get)
         ch_info = self._build_ch_info(channels)
         new_ch_ax = AxisArray.CoordinateAxis(data=ch_info, dims=["ch"], unit="struct")
+        new_ch_ax.fingerprint
         old = st.template
         st.template = replace(old, axes={**old.axes, "ch": new_ch_ax})
 

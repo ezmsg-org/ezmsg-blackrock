@@ -9,7 +9,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
-    "ezmsg-baseproc>=1.9.0",
+    "ezmsg-baseproc>=1.13.0",
     "ezmsg-event",
     # 3.10.0b2 for AxisArray.chunk_dim and CoordinateAxis.fingerprint.
     "ezmsg>=3.10.0b2",

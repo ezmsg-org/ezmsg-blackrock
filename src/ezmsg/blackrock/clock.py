@@ -20,7 +20,7 @@ import asyncio
 import logging
 
 import ezmsg.core as ez
-from ezmsg.baseproc import processor_state
+from ezmsg.baseproc import processor_state, resolve_stream_dim
 from ezmsg.baseproc.stateful import BaseStatefulTransformer
 from ezmsg.baseproc.units import BaseTransformerUnit
 from ezmsg.util.messages.axisarray import AxisArray, replace
@@ -134,11 +134,15 @@ class CbtimeToMonotonicTransformer(
             self.state.session = None
 
     def _process(self, message: AxisArray) -> AxisArray:
-        if self.state.session is None or "time" not in message.axes:
+        # The offset being converted is the one that advances every message,
+        # which is the stream dimension by definition -- "time" on a raw signal,
+        # but not after a stage that re-chunks the stream.
+        dim = resolve_stream_dim(message)
+        if self.state.session is None or dim not in message.axes:
             # TODO: Maybe return None here.
             return message
-        time_ax = message.axes["time"]
-        n = message.data.shape[message.dims.index("time")] if "time" in message.dims else 1
+        time_ax = message.axes[dim]
+        n = message.data.shape[message.dims.index(dim)] if dim in message.dims else 1
         gain = float(getattr(time_ax, "gain", 0.0) or 0.0)
         # Convert the first AND last sample (device ns) as one batch so the
         # library's per-stream monotonic floor advances to this message's end.
@@ -151,7 +155,7 @@ class CbtimeToMonotonicTransformer(
             return message  # no clock sync yet
         return replace(
             message,
-            axes={**message.axes, "time": replace(time_ax, offset=offsets[0])},
+            axes={**message.axes, dim: replace(time_ax, offset=offsets[0])},
         )
 
     def close(self) -> None:

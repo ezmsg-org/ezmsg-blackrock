@@ -73,6 +73,7 @@ from ezmsg.baseproc import (
     BaseStatefulTransformer,
     BaseTransformerUnit,
     processor_state,
+    resolve_stream_dim,
 )
 from ezmsg.util.messages.axisarray import AxisArray
 from ezmsg.util.messages.util import replace
@@ -173,6 +174,9 @@ class SamplingDelayAlignmentSettings(ez.Settings):
 class SamplingDelayAlignmentState:
     """State for :class:`SamplingDelayAlignmentTransformer`."""
 
+    axis: str = ""
+    """The resolved stream dimension, fixed at reset so every later use agrees."""
+
     fir: npt.NDArray | None = None
     """Per-channel sinc FIR taps, shape ``(filter_len, n_ch)``."""
 
@@ -259,21 +263,25 @@ class SamplingDelayAlignmentTransformer(
         return np.arange(n_ch) % self.settings.bank_size
 
     def _hash_message(self, message: AxisArray) -> int:
-        time_idx = message.get_axis_idx("time")
+        # Runs before `_reset_state`, so the axis is resolved from the message
+        # rather than read back off state that does not exist yet.
+        axis = resolve_stream_dim(message)
+        time_idx = message.get_axis_idx(axis)
         sample_shape = message.data.shape[:time_idx] + message.data.shape[time_idx + 1 :]
         # Include the slot layout so a metadata change (e.g. a new channel map)
         # re-designs the filters even when shape/key/gain are unchanged.
         slot = self._channel_slots(message)
-        return hash((message.key, message.axes["time"].gain, sample_shape, slot.tobytes()))
+        return hash((message.key, message.axes[axis].gain, sample_shape, slot.tobytes()))
 
     def _reset_state(self, message: AxisArray) -> None:
         if self._passthrough:
             return  # no filters to design; _process returns the input as-is
-        time_idx = message.get_axis_idx("time")
+        self._state.axis = resolve_stream_dim(message)
+        time_idx = message.get_axis_idx(self._state.axis)
         sample_shape = message.data.shape[:time_idx] + message.data.shape[time_idx + 1 :]
         dtype = message.data.dtype
         xp, is_mlx = _namespace(message.data)
-        fs = 1.0 / message.axes["time"].gain
+        fs = 1.0 / message.axes[self._state.axis].gain
 
         slot = self._channel_slots(message)
         # Fractional-sample delay that brings each channel back to its bank start.
@@ -444,7 +452,7 @@ class SamplingDelayAlignmentTransformer(
     def _process(self, message: AxisArray) -> AxisArray:
         if self._passthrough:
             return message
-        ax_idx = message.get_axis_idx("time")
+        ax_idx = message.get_axis_idx(self._state.axis)
         x = message.data
         xp, is_mlx = _namespace(x)
         moved = ax_idx != 0
@@ -486,12 +494,12 @@ class SamplingDelayAlignmentTransformer(
 
         # Output sample i carries the bank-start signal delayed by bulk_delay
         # samples; shift the time-axis offset so timestamps stay physical.
-        time_axis = message.axes["time"]
+        time_axis = message.axes[self._state.axis]
         new_axis = replace(
             time_axis,
             offset=time_axis.offset - st.bulk_delay * time_axis.gain,
         )
-        return replace(message, data=y, axes={**message.axes, "time": new_axis})
+        return replace(message, data=y, axes={**message.axes, self._state.axis: new_axis})
 
 
 class SamplingDelayAlignment(

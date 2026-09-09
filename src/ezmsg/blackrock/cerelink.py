@@ -516,7 +516,7 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
             key=rate.name,
             # Messages append along `time`; everything else describes the
             # subscription. Consumers key their cached state on that distinction.
-            chunk_dim="time",
+            stream_dim="time",
             attrs={
                 "unit": "uV" if self.settings.microvolts else "raw",
                 "manufacturer": "CereLink",
@@ -773,7 +773,7 @@ class CereLinkSpikeProducer(_CereLinkBaseProducer[CereLinkSpikeSettings, CereLin
             dims=["time", "ch", "unit"],
             axes={"time": time_ax, "ch": ch_ax, "unit": unit_ax},
             key="SPIKES",
-            chunk_dim="time",
+            stream_dim="time",
             attrs={
                 "unit": "count",
                 "manufacturer": "CereLink",

@@ -9,11 +9,11 @@ readme = "README.md"
 requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
-    "ezmsg-baseproc>=1.13.0",
+    "ezmsg-baseproc>=1.14.0",
     "ezmsg-event",
     # 3.10.0b3 for AxisArray.stream_dim and CoordinateAxis.fingerprint.
     "ezmsg>=3.10.0b3",
-    "pycbsdk>=10.1.0",
+    "pycbsdk>=10.2.0",
     "scipy",
 ]
 
@@ -38,7 +38,7 @@ lint = [
 test = [
   "pytest",
   "pytest-timeout",
-  "ezmsg-neo>=0.5.0",
+  "ezmsg-neo>=0.7.0",
   # So CI exercises the numba-jitted SamplingDelayAlignment kernels.
   "numba>=0.59",
 ]

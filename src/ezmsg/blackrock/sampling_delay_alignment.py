@@ -73,7 +73,7 @@ from ezmsg.baseproc import (
     BaseStatefulTransformer,
     BaseTransformerUnit,
     processor_state,
-    resolve_chunk_dim,
+    resolve_stream_dim,
 )
 from ezmsg.util.messages.axisarray import AxisArray
 from ezmsg.util.messages.util import replace
@@ -175,7 +175,7 @@ class SamplingDelayAlignmentState:
     """State for :class:`SamplingDelayAlignmentTransformer`."""
 
     axis: str = ""
-    """The resolved chunk dimension, fixed at reset so every later use agrees."""
+    """The resolved stream dimension, fixed at reset so every later use agrees."""
 
     fir: npt.NDArray | None = None
     """Per-channel sinc FIR taps, shape ``(filter_len, n_ch)``."""
@@ -265,7 +265,7 @@ class SamplingDelayAlignmentTransformer(
     def _hash_message(self, message: AxisArray) -> int:
         # Runs before `_reset_state`, so the axis is resolved from the message
         # rather than read back off state that does not exist yet.
-        axis = resolve_chunk_dim(message)
+        axis = resolve_stream_dim(message)
         time_idx = message.get_axis_idx(axis)
         sample_shape = message.data.shape[:time_idx] + message.data.shape[time_idx + 1 :]
         # Include the slot layout so a metadata change (e.g. a new channel map)
@@ -276,7 +276,7 @@ class SamplingDelayAlignmentTransformer(
     def _reset_state(self, message: AxisArray) -> None:
         if self._passthrough:
             return  # no filters to design; _process returns the input as-is
-        self._state.axis = resolve_chunk_dim(message)
+        self._state.axis = resolve_stream_dim(message)
         time_idx = message.get_axis_idx(self._state.axis)
         sample_shape = message.data.shape[:time_idx] + message.data.shape[time_idx + 1 :]
         dtype = message.data.dtype

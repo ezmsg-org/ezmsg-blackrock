@@ -20,7 +20,7 @@ import asyncio
 import logging
 
 import ezmsg.core as ez
-from ezmsg.baseproc import processor_state, resolve_chunk_dim
+from ezmsg.baseproc import processor_state, resolve_stream_dim
 from ezmsg.baseproc.stateful import BaseStatefulTransformer
 from ezmsg.baseproc.units import BaseTransformerUnit
 from ezmsg.util.messages.axisarray import AxisArray, replace
@@ -135,9 +135,9 @@ class CbtimeToMonotonicTransformer(
 
     def _process(self, message: AxisArray) -> AxisArray:
         # The offset being converted is the one that advances every message,
-        # which is the chunk dimension by definition -- "time" on a raw signal,
+        # which is the stream dimension by definition -- "time" on a raw signal,
         # but not after a stage that re-chunks the stream.
-        dim = resolve_chunk_dim(message)
+        dim = resolve_stream_dim(message)
         if self.state.session is None or dim not in message.axes:
             # TODO: Maybe return None here.
             return message

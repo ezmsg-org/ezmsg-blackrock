@@ -17,6 +17,16 @@ dependencies = [
     "scipy",
 ]
 
+
+[project.entry-points."ezmsg.components"]
+"blackrock.CbtimeToMonotonic" = "ezmsg.blackrock.clock:CbtimeToMonotonic"
+"blackrock.CereLinkSignalSource" = "ezmsg.blackrock.cerelink:CereLinkSignalSource"
+"blackrock.CereLinkSpikeSource" = "ezmsg.blackrock.cerelink:CereLinkSpikeSource"
+"blackrock.CerePlexImpedance" = "ezmsg.blackrock.cereplex_impedance:CerePlexImpedance"
+"blackrock.ChannelMapUnit" = "ezmsg.blackrock.channel_map:ChannelMapUnit"
+"blackrock.SamplingDelayAlignment" = "ezmsg.blackrock.sampling_delay_alignment:SamplingDelayAlignment"
+
+
 [project.optional-dependencies]
 accel = [
     # JIT-compiled kernels for SamplingDelayAlignment's numpy path (FIR and

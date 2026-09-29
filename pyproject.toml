@@ -13,7 +13,7 @@ dependencies = [
     "ezmsg-event",
     # 3.10.0b3 for AxisArray.stream_dim and CoordinateAxis.fingerprint.
     "ezmsg>=3.10.0b4",
-    "pycbsdk>=10.2.0",
+    "pycbsdk>=10.3.0",
     "scipy",
 ]
 

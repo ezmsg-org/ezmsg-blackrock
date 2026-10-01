@@ -85,7 +85,10 @@ html_baseurl = "https://www.ezmsg.org/ezmsg-blackrock/"
 html_theme_options = {
     "logo": {
         "text": f"ezmsg.blackrock {version}",
-        "link": "https://ezmsg.org",  # Link back to main site
+        "link": "https://www.ezmsg.org",
+        "image_light": "https://www.ezmsg.org/_static/_images/ezmsg_logo.png",
+        "image_dark": "https://www.ezmsg.org/_static/_images/ezmsg_logo.png",
+        "alt_text": "ezmsg.org",
     },
     "header_links_before_dropdown": 4,
     "navbar_start": ["navbar-logo"],

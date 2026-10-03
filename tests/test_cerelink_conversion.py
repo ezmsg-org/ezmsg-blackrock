@@ -51,3 +51,26 @@ def test_mixed_values_stay_per_channel():
     assert isinstance(out, np.ndarray)
     np.testing.assert_array_equal(out, values)
     assert out is not values
+
+
+def test_toggling_microvolts_relabels_the_template_once():
+    """``microvolts`` is a non-reset setting: the template's attrs follow it on
+    the settings change, not per message."""
+    from ezmsg.util.messages.axisarray import AxisArray
+
+    from ezmsg.blackrock.cerelink import CereLinkSignalProducer, CereLinkSignalSettings, DeviceType
+
+    producer = CereLinkSignalProducer(settings=CereLinkSignalSettings(device_type=DeviceType.NPLAY, microvolts=True))
+    st = producer.state
+    st.conversion = np.array([0.25, 0.25])
+    st.conversion_offset = np.zeros(2)
+    st.template = AxisArray(np.zeros((0, 2)), dims=["time", "ch"], attrs=producer._signal_attrs())
+    assert st.template.attrs == {"unit": "uV", "manufacturer": "CereLink", "device": "NPLAY"}
+
+    producer.update_settings(CereLinkSignalSettings(device_type=DeviceType.NPLAY, microvolts=False))
+    assert st.template.attrs["conversion"] == 0.25
+    assert st.template.attrs["offset"] == 0.0
+    assert st.template.attrs["unit"] == "uV"
+
+    producer.update_settings(CereLinkSignalSettings(device_type=DeviceType.NPLAY, microvolts=True))
+    assert "conversion" not in st.template.attrs and "offset" not in st.template.attrs

@@ -263,8 +263,6 @@ class CereLinkSignalProducerState(_CereLinkSharedState):
     template: AxisArray | None = None
     conversion: np.ndarray | None = None  # float64 [n_ch], raw -> uV slope
     conversion_offset: np.ndarray | None = None  # float64 [n_ch], uV at raw 0 (not a time offset)
-    uv_attrs: dict | None = None  # attrs of microvolt messages
-    raw_attrs: dict | None = None  # attrs of raw messages: uv_attrs + conversion/offset
     data_event: asyncio.Event | None = None  # set by callback when new samples arrive
 
 
@@ -558,14 +556,6 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
             # subscription. Consumers key their cached state on that distinction.
             stream_dim="time",
         )
-        # Both attr sets are built now; each message takes the one matching
-        # the current ``microvolts``, which can change without a re-subscribe.
-        uv_attrs = {"unit": "uV", "manufacturer": "CereLink", "device": self._device_name()}
-        raw_attrs = {
-            **uv_attrs,
-            "conversion": _per_channel_or_scalar(conversion),
-            "offset": _per_channel_or_scalar(conversion_offset),
-        }
 
         st = self.state
         st.buffer_data = np.zeros((buff_samples, n_ch), dtype=np.int16)
@@ -573,16 +563,33 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
         st.write_idx = 0
         st.read_idx = 0
         st.n_channels = n_ch
-        st.template = template
         st.conversion = conversion
         st.conversion_offset = conversion_offset
-        st.uv_attrs = uv_attrs
-        st.raw_attrs = raw_attrs
+        st.template = replace(template, attrs=self._signal_attrs())
         st.data_event = asyncio.Event()
 
         @st.session.on_group_batch(rate)
         def _on_group_batch(samples, timestamps):
             self._handle_group_batch(samples, timestamps, loop)
+
+    def update_settings(self, new_settings: CereLinkSignalSettings) -> None:
+        """Also relabel the template when ``microvolts`` changes in place (it is non-reset)."""
+        old_microvolts = self.settings.microvolts
+        super().update_settings(new_settings)
+        if self.state.template is not None and self.settings.microvolts != old_microvolts:
+            self.state.template = replace(self.state.template, attrs=self._signal_attrs())
+
+    def _signal_attrs(self) -> dict:
+        """Stream-level attrs for the current ``microvolts`` setting.
+
+        ``unit`` names the values after conversion, so it is ``"uV"`` either
+        way; raw messages add ``conversion`` / ``offset`` to get there.
+        """
+        attrs = {"unit": "uV", "manufacturer": "CereLink", "device": self._device_name()}
+        if not self.settings.microvolts:
+            attrs["conversion"] = _per_channel_or_scalar(self.state.conversion)
+            attrs["offset"] = _per_channel_or_scalar(self.state.conversion_offset)
+        return attrs
 
     def _compute_conversion(self, channels: list[int]) -> tuple[np.ndarray, np.ndarray]:
         """Per-channel ``(conversion, offset)`` with ``uV = raw * conversion + offset``."""
@@ -679,7 +686,6 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
                 template,
                 data=out_dat,
                 axes={**template.axes, "time": new_time_ax},
-                attrs=dict(st.uv_attrs if self.settings.microvolts else st.raw_attrs),
             )
             st.read_idx = read_term % buff_len
             return result

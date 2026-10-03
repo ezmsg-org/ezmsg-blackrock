@@ -69,7 +69,10 @@ class TestCereLinkSignalSource:
             assert msg.data.dtype == np.int16
             assert 1.0 / msg.axes["time"].gain == pytest.approx(30_000.0)
             assert msg.key == "SR_30kHz"
-            assert msg.attrs["unit"] == "raw"
+            # Raw samples record how to reach the unit: uV = sample * conversion + offset.
+            assert msg.attrs["unit"] == "uV"
+            assert msg.attrs["conversion"] == pytest.approx(0.25)
+            assert msg.attrs["offset"] == pytest.approx(0.0)
             assert msg.attrs["manufacturer"] == "CereLink"
             assert msg.attrs["device"] == "NPLAY"
 
@@ -93,6 +96,7 @@ class TestCereLinkSignalSource:
             assert msg.data.shape[1] == n_ch
             assert msg.data.dtype == np.float64
             assert msg.attrs["unit"] == "uV"
+            assert "conversion" not in msg.attrs and "offset" not in msg.attrs
             assert msg.attrs["manufacturer"] == "CereLink"
             assert msg.attrs["device"] == "NPLAY"
 

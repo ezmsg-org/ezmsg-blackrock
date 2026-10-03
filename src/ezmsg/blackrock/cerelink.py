@@ -148,7 +148,8 @@ class CereLinkSignalSettings(ez.Settings):
     """True = raw device nanoseconds/1e9; False = ``time.monotonic()`` via clock sync."""
 
     microvolts: bool = True
-    """Convert int16 → µV using each channel's scaling from the device.
+    """Convert int16 → µV using each channel's physical scaling from the device
+    (pycbsdk's ``Session.get_channel_conversion``).
 
     ``False`` emits the raw int16 samples, with ``attrs["conversion"]`` and
     ``attrs["offset"]`` recording how to recover microvolts
@@ -220,23 +221,27 @@ class _CereLinkSharedState:
     ch_positions: dict | None = None  # ch_id -> (x, y, size, headstage, bank_num, term)
 
 
-def _channel_conversion(scaling: dict | None) -> tuple[float, float]:
+# Microvolts per one of each unit a channel's scaling may report.
+_UV_PER_UNIT = {"v": 1e6, "mv": 1e3, "uv": 1.0, "µv": 1.0, "μv": 1.0, "nv": 1e-3}
+
+
+def _channel_conversion(conversion: dict | None) -> tuple[float, float]:
     """``(conversion, offset)`` taking one channel's raw samples to microvolts.
 
-    pycbsdk's scaling maps the digital range onto the analog one,
-    ``value = anamin + (raw - digmin) * (anamax - anamin) / (digmax - digmin)``
-    in ``anaunit`` (``mV`` or ``uV``), so ``offset = anamin - digmin * conversion``;
-    it is 0 for the usual symmetric ranges. A channel without usable scaling
-    passes its raw values through (``(1.0, 0.0)``).
+    ``conversion`` is pycbsdk's ``Session.get_channel_conversion`` result for the
+    channel's physical scaling: ``physical = raw * scale + offset`` in ``unit``
+    (``uV`` for a Gemini front end, ``mV`` for NSP analog inputs). Both are
+    rescaled from ``unit`` to microvolts. A channel without a usable map
+    (``None``, e.g. an unconfigured channel) or with a non-voltage unit passes
+    its raw values through: ``(1.0, 0.0)``.
     """
-    if not scaling or scaling["digmax"] == scaling["digmin"]:
+    if conversion is None:
         return 1.0, 0.0
-    conversion = (scaling["anamax"] - scaling["anamin"]) / (scaling["digmax"] - scaling["digmin"])
-    offset = scaling["anamin"] - scaling["digmin"] * conversion
-    if scaling["anaunit"] == "mV":
-        conversion *= 1000.0
-        offset *= 1000.0
-    return float(conversion), float(offset)
+    uv_per_unit = _UV_PER_UNIT.get(conversion["unit"].strip().lower())
+    if uv_per_unit is None:
+        logger.warning("CereLink: channel scaling in unit %r is not a voltage; passing raw values", conversion["unit"])
+        return 1.0, 0.0
+    return float(conversion["scale"]) * uv_per_unit, float(conversion["offset"]) * uv_per_unit
 
 
 def _per_channel_or_scalar(values: np.ndarray) -> float | np.ndarray:
@@ -593,7 +598,8 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
 
     def _compute_conversion(self, channels: list[int]) -> tuple[np.ndarray, np.ndarray]:
         """Per-channel ``(conversion, offset)`` with ``uV = raw * conversion + offset``."""
-        pairs = [_channel_conversion(self.state.session.get_channel_scaling(ch_id)) for ch_id in channels]
+        session = self.state.session
+        pairs = [_channel_conversion(session.get_channel_conversion(ch_id, source="physical")) for ch_id in channels]
         conversion = np.array([c for c, _ in pairs], dtype=np.float64)
         offset = np.array([o for _, o in pairs], dtype=np.float64)
         return conversion, offset

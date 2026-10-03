@@ -1,4 +1,4 @@
-"""Raw-to-microvolt conversion derived from pycbsdk channel scaling.
+"""Raw-to-microvolt conversion from pycbsdk's per-channel physical conversion.
 
 ``CereLinkSignalSource`` multiplies by it when ``microvolts`` is set, and
 otherwise records it as ``attrs["conversion"]`` / ``attrs["offset"]``
@@ -11,33 +11,24 @@ import pytest
 from ezmsg.blackrock.cerelink import _channel_conversion, _per_channel_or_scalar
 
 
-def _scaling(digmin, digmax, anamin, anamax, anaunit="uV"):
-    return {"digmin": digmin, "digmax": digmax, "anamin": anamin, "anamax": anamax, "anaunit": anaunit}
+def _conversion(scale, offset=0.0, unit="uV"):
+    """What pycbsdk's ``Session.get_channel_conversion`` returns."""
+    return {"scale": scale, "offset": offset, "unit": unit}
 
 
-def test_symmetric_front_end_range():
-    conversion, offset = _channel_conversion(_scaling(-32764, 32764, -8191, 8191))
-    assert conversion == pytest.approx(0.25)
-    assert offset == pytest.approx(0.0)
+def test_microvolt_channels_pass_through():
+    assert _channel_conversion(_conversion(0.25)) == (0.25, 0.0)
 
 
 def test_millivolt_channels_convert_to_microvolts():
-    conversion, offset = _channel_conversion(_scaling(-32764, 32764, -5000, 5000, "mV"))
+    conversion, offset = _channel_conversion(_conversion(5000 / 32764, -0.5, "mV"))
     assert conversion == pytest.approx(5000 * 1000 / 32764)
-    assert offset == pytest.approx(0.0)
+    assert offset == pytest.approx(-500.0)
 
 
-def test_asymmetric_range_has_an_offset():
-    scaling = _scaling(0, 1000, -10, 90)
-    conversion, offset = _channel_conversion(scaling)
-    # Both ends of the digital range map onto the analog range.
-    assert 0 * conversion + offset == pytest.approx(-10)
-    assert 1000 * conversion + offset == pytest.approx(90)
-
-
-@pytest.mark.parametrize("scaling", [None, {}, _scaling(5, 5, 0, 1)])
-def test_unusable_scaling_passes_raw_values_through(scaling):
-    assert _channel_conversion(scaling) == (1.0, 0.0)
+@pytest.mark.parametrize("value", [None, _conversion(2.0, 0.0, "degC")], ids=["no usable map", "not a voltage"])
+def test_unusable_channels_pass_raw_values_through(value):
+    assert _channel_conversion(value) == (1.0, 0.0)
 
 
 def test_shared_values_collapse_to_a_scalar():

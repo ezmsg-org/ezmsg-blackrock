@@ -148,7 +148,14 @@ class CereLinkSignalSettings(ez.Settings):
     """True = raw device nanoseconds/1e9; False = ``time.monotonic()`` via clock sync."""
 
     microvolts: bool = True
-    """Convert int16 → µV using channel scale factors."""
+    """Convert int16 → µV using each channel's physical scaling from the device
+    (pycbsdk's ``Session.get_channel_conversion``).
+
+    ``False`` emits the raw int16 samples, with ``attrs["conversion"]`` and
+    ``attrs["offset"]`` recording how to recover microvolts
+    (``uV = sample * conversion + offset``, the convention ezmsg-sigproc's
+    ``Digitize`` uses and an ezmsg-lsl outlet publishes). ``attrs["unit"]`` is
+    ``"uV"`` either way: it names the unit of the values, after conversion."""
 
     cont_buffer_dur: float = 0.5
     """Ring buffer duration in seconds."""
@@ -214,6 +221,41 @@ class _CereLinkSharedState:
     ch_positions: dict | None = None  # ch_id -> (x, y, size, headstage, bank_num, term)
 
 
+# Microvolts per one of each unit a channel's scaling may report.
+_UV_PER_UNIT = {"v": 1e6, "mv": 1e3, "uv": 1.0, "µv": 1.0, "μv": 1.0, "nv": 1e-3}
+
+
+def _channel_conversion(conversion: dict | None) -> tuple[float, float]:
+    """``(conversion, offset)`` taking one channel's raw samples to microvolts.
+
+    ``conversion`` is pycbsdk's ``Session.get_channel_conversion`` result for the
+    channel's physical scaling: ``physical = raw * scale + offset`` in ``unit``
+    (``uV`` for a Gemini front end, ``mV`` for NSP analog inputs). Both are
+    rescaled from ``unit`` to microvolts. A channel without a usable map
+    (``None``, e.g. an unconfigured channel) or with a non-voltage unit passes
+    its raw values through: ``(1.0, 0.0)``.
+    """
+    if conversion is None:
+        return 1.0, 0.0
+    uv_per_unit = _UV_PER_UNIT.get(conversion["unit"].strip().lower())
+    if uv_per_unit is None:
+        logger.warning("CereLink: channel scaling in unit %r is not a voltage; passing raw values", conversion["unit"])
+        return 1.0, 0.0
+    return float(conversion["scale"]) * uv_per_unit, float(conversion["offset"]) * uv_per_unit
+
+
+def _per_channel_or_scalar(values: np.ndarray) -> float | np.ndarray:
+    """A float when every channel shares the value, else a copy of the per-channel array.
+
+    A scalar matches what ezmsg-sigproc's ``Digitize`` stamps and what an
+    ezmsg-lsl outlet can publish in ``<desc>``; a mixed group (e.g. front-end
+    and analog-input channels) needs one value per channel along ``ch``.
+    """
+    if values.size and np.all(values == values[0]):
+        return float(values[0])
+    return values.copy()
+
+
 @processor_state
 class CereLinkSignalProducerState(_CereLinkSharedState):
     """Signal-producer ring buffer + emission template."""
@@ -224,7 +266,8 @@ class CereLinkSignalProducerState(_CereLinkSharedState):
     read_idx: int = 0
     n_channels: int = 0
     template: AxisArray | None = None
-    scale_factors: np.ndarray | None = None
+    conversion: np.ndarray | None = None  # float64 [n_ch], raw -> uV slope
+    conversion_offset: np.ndarray | None = None  # float64 [n_ch], uV at raw 0 (not a time offset)
     data_event: asyncio.Event | None = None  # set by callback when new samples arrive
 
 
@@ -498,7 +541,7 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
         fs = rate.hz
         buff_samples = max(1, int(self.settings.cont_buffer_dur * fs))
 
-        scale_factors = self._compute_scale_factors(channels)
+        conversion, conversion_offset = self._compute_conversion(channels)
         ch_info = self._build_ch_info(channels)
         time_ax = AxisArray.TimeAxis(fs, offset=0.0)
         ch_ax = AxisArray.CoordinateAxis(data=ch_info, dims=["ch"], unit="struct")
@@ -517,11 +560,6 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
             # Messages append along `time`; everything else describes the
             # subscription. Consumers key their cached state on that distinction.
             stream_dim="time",
-            attrs={
-                "unit": "uV" if self.settings.microvolts else "raw",
-                "manufacturer": "CereLink",
-                "device": self._device_name(),
-            },
         )
 
         st = self.state
@@ -530,26 +568,41 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
         st.write_idx = 0
         st.read_idx = 0
         st.n_channels = n_ch
-        st.template = template
-        st.scale_factors = scale_factors
+        st.conversion = conversion
+        st.conversion_offset = conversion_offset
+        st.template = replace(template, attrs=self._signal_attrs())
         st.data_event = asyncio.Event()
 
         @st.session.on_group_batch(rate)
         def _on_group_batch(samples, timestamps):
             self._handle_group_batch(samples, timestamps, loop)
 
-    def _compute_scale_factors(self, channels: list[int]) -> np.ndarray:
-        sfs = []
-        for ch_id in channels:
-            scaling = self.state.session.get_channel_scaling(ch_id)
-            if scaling and scaling["digmax"] != scaling["digmin"]:
-                sf = (scaling["anamax"] - scaling["anamin"]) / (scaling["digmax"] - scaling["digmin"])
-                if scaling["anaunit"] == "mV":
-                    sf *= 1000  # mV -> uV
-                sfs.append(sf)
-            else:
-                sfs.append(1.0)
-        return np.array(sfs, dtype=np.float64)
+    def update_settings(self, new_settings: CereLinkSignalSettings) -> None:
+        """Also relabel the template when ``microvolts`` changes in place (it is non-reset)."""
+        old_microvolts = self.settings.microvolts
+        super().update_settings(new_settings)
+        if self.state.template is not None and self.settings.microvolts != old_microvolts:
+            self.state.template = replace(self.state.template, attrs=self._signal_attrs())
+
+    def _signal_attrs(self) -> dict:
+        """Stream-level attrs for the current ``microvolts`` setting.
+
+        ``unit`` names the values after conversion, so it is ``"uV"`` either
+        way; raw messages add ``conversion`` / ``offset`` to get there.
+        """
+        attrs = {"unit": "uV", "manufacturer": "CereLink", "device": self._device_name()}
+        if not self.settings.microvolts:
+            attrs["conversion"] = _per_channel_or_scalar(self.state.conversion)
+            attrs["offset"] = _per_channel_or_scalar(self.state.conversion_offset)
+        return attrs
+
+    def _compute_conversion(self, channels: list[int]) -> tuple[np.ndarray, np.ndarray]:
+        """Per-channel ``(conversion, offset)`` with ``uV = raw * conversion + offset``."""
+        session = self.state.session
+        pairs = [_channel_conversion(session.get_channel_conversion(ch_id, source="physical")) for ch_id in channels]
+        conversion = np.array([c for c, _ in pairs], dtype=np.float64)
+        offset = np.array([o for _, o in pairs], dtype=np.float64)
+        return conversion, offset
 
     def _handle_group_batch(
         self,
@@ -616,7 +669,9 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
             read_slice = slice(read_idx, read_term)
             out_dat = st.buffer_data[read_slice].copy()
             if self.settings.microvolts:
-                out_dat = out_dat * st.scale_factors[None, :]
+                out_dat = out_dat * st.conversion[None, :]
+                if np.any(st.conversion_offset):
+                    out_dat += st.conversion_offset[None, :]
 
             ts_batch = st.buffer_timestamps[read_slice]
             if self.settings.cbtime:

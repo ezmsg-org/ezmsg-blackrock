@@ -160,6 +160,18 @@ class CereLinkSignalSettings(ez.Settings):
     cont_buffer_dur: float = 0.5
     """Ring buffer duration in seconds."""
 
+    gap_tolerance: float = 0.010
+    """The smallest margin, in seconds, above one sample period that the interval
+    between two samples' device timestamps must exceed to count as a gap. The
+    margin is never less than one period. A step backward is a gap too.
+
+    A batch is cut at a gap, so every message stays regularly sampled, and the
+    first message after one starts a new
+    :attr:`~ezmsg.util.messages.axisarray.AxisArray.segment`, on which stateful
+    processors downstream reset. Device time is used whatever ``cbtime`` is. The
+    default matches ezmsg-nwb's, so a recording segments on replay as it did live.
+    ``float("inf")`` turns gap detection off. Can be changed while running."""
+
     cmp_configs: tuple[ChannelMapSettings, ...] = ()
     """One :class:`ChannelMapSettings` per headstage applied after connection."""
 
@@ -264,6 +276,7 @@ class CereLinkSignalProducerState(_CereLinkSharedState):
     buffer_timestamps: np.ndarray | None = None  # uint64 [N_t]
     write_idx: int = 0
     read_idx: int = 0
+    last_ts_ns: int | None = None  # device time of the last sample emitted
     n_channels: int = 0
     template: AxisArray | None = None
     conversion: np.ndarray | None = None  # float64 [n_ch], raw -> uV slope
@@ -283,11 +296,14 @@ class _CereLinkBaseProducer(
     and after every :meth:`_request_reset`).
     """
 
-    NONRESET_SETTINGS_FIELDS = frozenset({"cbtime", "microvolts", "cmp_configs"})
+    NONRESET_SETTINGS_FIELDS = frozenset({"cbtime", "microvolts", "cmp_configs", "gap_tolerance"})
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._status_callback: typing.Callable[[DeviceStatus], None] | None = None
+        # The output `segment`. Kept off the state so that reopening the device
+        # moves it on instead of repeating a number already sent.
+        self._segment = -1
 
     def set_status_callback(self, cb: typing.Callable[[DeviceStatus], None]) -> None:
         """Inject the unit's status emitter — wired up by the Source on construct
@@ -357,6 +373,7 @@ class _CereLinkBaseProducer(
             await asyncio.to_thread(self.state.session.sync)
             self._cache_channel_metadata()
             self._setup_subscription(loop)
+            self._segment += 1  # a (re)opened or reconfigured device continues nothing
         except BaseException:
             logger.exception(
                 "CereLink: open_and_configure failed for device_type=%r, settings=%r",
@@ -487,6 +504,7 @@ class _CereLinkBaseProducer(
                 self.state.session.load_channel_map(cfg.filepath, cfg.start_chan, cfg.hs_id)
         self._cache_channel_metadata()
         self._on_channel_maps_reloaded()
+        self._segment += 1  # the channels are not what they were
 
     def _on_channel_maps_reloaded(self) -> None:
         """Subclass hook: rebuild template's ``ch`` axis with refreshed positions."""
@@ -567,6 +585,7 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
         st.buffer_timestamps = np.zeros(buff_samples, dtype=np.uint64)
         st.write_idx = 0
         st.read_idx = 0
+        st.last_ts_ns = None
         st.n_channels = n_ch
         st.conversion = conversion
         st.conversion_offset = conversion_offset
@@ -666,6 +685,19 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
                     return None
                 continue
 
+            # Gaps are judged on device time, in integer ns, whatever clock the
+            # offsets are given in. Cut the batch at the first one; the rest goes
+            # out on the next call, where it is seen as starting a new segment.
+            period_ns = 1e9 * st.template.axes["time"].gain
+            margin_ns = max(self.settings.gap_tolerance * 1e9, period_ns)
+            ts_ns = st.buffer_timestamps[read_idx:read_term].astype(np.int64)
+            breaks = np.flatnonzero(np.abs(np.diff(ts_ns) - period_ns) > margin_ns)
+            if breaks.size:
+                read_term = read_idx + int(breaks[0]) + 1
+            if st.last_ts_ns is not None and abs(int(ts_ns[0]) - st.last_ts_ns - period_ns) > margin_ns:
+                self._segment += 1
+            st.last_ts_ns = int(ts_ns[read_term - read_idx - 1])
+
             read_slice = slice(read_idx, read_term)
             out_dat = st.buffer_data[read_slice].copy()
             if self.settings.microvolts:
@@ -692,6 +724,7 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
                 template,
                 data=out_dat,
                 axes={**template.axes, "time": new_time_ax},
+                segment=self._segment,
             )
             st.read_idx = read_term % buff_len
             return result
@@ -949,7 +982,8 @@ class CereLinkSpikeProducer(_CereLinkBaseProducer[CereLinkSpikeSettings, CereLin
 
         template = st.template
         new_time_ax = replace(template.axes["time"], offset=new_offset)
-        return replace(template, data=out_data, axes={**template.axes, "time": new_time_ax})
+        # Sparse spikes cannot show a gap; the segment only moves on when the device is reopened or remapped.
+        return replace(template, data=out_data, axes={**template.axes, "time": new_time_ax}, segment=self._segment)
 
 
 class CereLinkSpikeSource(BaseProducerUnit[CereLinkSpikeSettings, AxisArray, CereLinkSpikeProducer]):

@@ -9,10 +9,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
-    "ezmsg-baseproc>=1.15.0",
+    "ezmsg-baseproc>=1.16.0",
     "ezmsg-event",
     # 3.10.0b3 for AxisArray.stream_dim and CoordinateAxis.fingerprint.
-    "ezmsg>=3.10.0b5",
+    "ezmsg>=3.10.0b6",
     "pycbsdk>=10.4.0",
     "scipy",
 ]

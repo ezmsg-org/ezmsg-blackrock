@@ -262,17 +262,6 @@ class SamplingDelayAlignmentTransformer(
             return data["elec"].astype(np.int64) - 1
         return np.arange(n_ch) % self.settings.bank_size
 
-    def _hash_message(self, message: AxisArray) -> int:
-        # Runs before `_reset_state`, so the axis is resolved from the message
-        # rather than read back off state that does not exist yet.
-        axis = resolve_stream_dim(message)
-        time_idx = message.get_axis_idx(axis)
-        sample_shape = message.data.shape[:time_idx] + message.data.shape[time_idx + 1 :]
-        # Include the slot layout so a metadata change (e.g. a new channel map)
-        # re-designs the filters even when shape/key/gain are unchanged.
-        slot = self._channel_slots(message)
-        return hash((message.key, message.axes[axis].gain, sample_shape, slot.tobytes()))
-
     def _reset_state(self, message: AxisArray) -> None:
         if self._passthrough:
             return  # no filters to design; _process returns the input as-is

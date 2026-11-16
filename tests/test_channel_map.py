@@ -4,7 +4,7 @@ import pathlib
 
 import numpy as np
 import pytest
-from ezmsg.util.messages.axisarray import AxisArray, CoordinateAxis, LinearAxis
+from ezmsg.util.messages.axisarray import AxisArray, CoordinateAxis, LinearAxis, compute_config_id
 
 from ezmsg.blackrock.channel_map import (
     CHANNEL_DTYPE,
@@ -567,3 +567,14 @@ class TestTheChannelAxisIsHandedOverPrimed:
         second = proc(_make_message(96)).axes["ch"]
         assert "_fingerprint" in second.__dict__
         assert second.fingerprint != first
+
+
+def test_relabel_at_same_channel_count_rereads_labels() -> None:
+    """An upstream relabel under a new config_id, channel count unchanged,
+    rebuilds the axis from the new incoming labels."""
+    proc = _make_processor()
+    for prefix in ("a", "b"):
+        msg = _make_message(4, ch_data=np.array([f"{prefix}{i}" for i in range(4)]))
+        msg.config_id = compute_config_id(msg)
+        out = proc(msg)
+        assert list(out.axes["ch"].data["label"]) == [f"{prefix}{i}" for i in range(4)]

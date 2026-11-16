@@ -20,7 +20,7 @@ import gc
 
 import numpy as np
 import pytest
-from ezmsg.util.messages.axisarray import AxisArray, CoordinateAxis, LinearAxis
+from ezmsg.util.messages.axisarray import AxisArray, CoordinateAxis, LinearAxis, compute_config_id
 
 import ezmsg.blackrock.sampling_delay_alignment as sda
 from ezmsg.blackrock.sampling_delay_alignment import (
@@ -184,6 +184,25 @@ def test_rail_threshold_is_nonreset():
     xr[100:103, 5] = 1e4
     out = proc(_aa(xr, offset=500 / FS))
     assert np.abs(out.data[95:140, 5]).max() < 100.0  # rail held, not rung
+
+
+def test_dtype_change_resets_state():
+    """A declared stream switching dtype at the same shape/key/gain rebuilds the
+    per-dtype state (taps, history), so the new chunk matches a fresh processor."""
+    rng = np.random.default_rng(6)
+
+    def declared(x: np.ndarray, offset: float = 0.0) -> AxisArray:
+        msg = _aa(x, offset=offset)
+        msg.config_id = compute_config_id(msg)
+        return msg
+
+    proc = sampling_delay_alignment()
+    proc(declared((rng.standard_normal((500, 16)) * 1000).astype(np.int16)))
+    x64 = rng.standard_normal((500, 16))
+    out = proc(declared(x64, offset=500 / FS))
+    expected = sampling_delay_alignment()(declared(x64, offset=500 / FS))
+    assert out.data.dtype == np.float64
+    np.testing.assert_allclose(out.data, expected.data, rtol=1e-12, atol=1e-12)
 
 
 def test_passthrough_shape_and_dtype():

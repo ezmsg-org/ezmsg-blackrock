@@ -15,7 +15,7 @@ import numpy as np
 from ezmsg.baseproc import processor_state
 from ezmsg.baseproc.stateful import BaseStatefulProducer
 from ezmsg.baseproc.units import BaseProducerUnit
-from ezmsg.util.messages.axisarray import AxisArray, replace
+from ezmsg.util.messages.axisarray import AxisArray, chain_config_id, compute_config_id, replace
 from pycbsdk import ChanInfoField, ChannelType, DeviceType, SampleRate, Session
 
 from .channel_map import CHANNEL_DTYPE, ChannelMapSettings, _array_identity
@@ -256,6 +256,16 @@ def _channel_conversion(conversion: dict | None) -> tuple[float, float]:
     return float(conversion["scale"]) * uv_per_unit, float(conversion["offset"]) * uv_per_unit
 
 
+def _with_config_id(template: AxisArray, *parts) -> AxisArray:
+    """``template`` stamped with its ``config_id``: digested once per (re)build, never per message.
+
+    ``parts`` are plain values that change what the values mean but that the layout digest
+    does not cover, such as a raw stream's scaling.
+    """
+    config_id = compute_config_id(template)
+    return replace(template, config_id=chain_config_id(config_id, *parts) if parts else config_id)
+
+
 def _per_channel_or_scalar(values: np.ndarray) -> float | np.ndarray:
     """A float when every channel shares the value, else a copy of the per-channel array.
 
@@ -302,7 +312,9 @@ class _CereLinkBaseProducer(
         super().__init__(*args, **kwargs)
         self._status_callback: typing.Callable[[DeviceStatus], None] | None = None
         # The output `segment`. Kept off the state so that reopening the device
-        # moves it on instead of repeating a number already sent.
+        # moves it on instead of repeating a number already sent. The first open makes it 0.
+        # Only a reopen (which always loses data) or a gap measured in device time moves it;
+        # a change made without reopening shows in `config_id` instead.
         self._segment = -1
 
     def set_status_callback(self, cb: typing.Callable[[DeviceStatus], None]) -> None:
@@ -373,7 +385,7 @@ class _CereLinkBaseProducer(
             await asyncio.to_thread(self.state.session.sync)
             self._cache_channel_metadata()
             self._setup_subscription(loop)
-            self._segment += 1  # a (re)opened or reconfigured device continues nothing
+            self._segment += 1  # a (re)opened device has lost data: a known gap
         except BaseException:
             logger.exception(
                 "CereLink: open_and_configure failed for device_type=%r, settings=%r",
@@ -503,8 +515,7 @@ class _CereLinkBaseProducer(
             if cfg.filepath:
                 self.state.session.load_channel_map(cfg.filepath, cfg.start_chan, cfg.hs_id)
         self._cache_channel_metadata()
-        self._on_channel_maps_reloaded()
-        self._segment += 1  # the channels are not what they were
+        self._on_channel_maps_reloaded()  # restamps config_id; no data is lost, so no new segment
 
     def _on_channel_maps_reloaded(self) -> None:
         """Subclass hook: rebuild template's ``ch`` axis with refreshed positions."""
@@ -571,7 +582,7 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
         # in every other process, on every message, for the life of the stream.
         ch_ax.fingerprint
         template = AxisArray(
-            np.zeros((0, 0)),
+            np.zeros((0, n_ch), dtype=np.float64 if self.settings.microvolts else np.int16),
             dims=["time", "ch"],
             axes={"time": time_ax, "ch": ch_ax},
             key=rate.name,
@@ -589,7 +600,7 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
         st.n_channels = n_ch
         st.conversion = conversion
         st.conversion_offset = conversion_offset
-        st.template = replace(template, attrs=self._signal_attrs())
+        st.template = _with_config_id(replace(template, attrs=self._signal_attrs()), *self._scaling())
         st.data_event = asyncio.Event()
 
         @st.session.on_group_batch(rate)
@@ -601,7 +612,20 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
         old_microvolts = self.settings.microvolts
         super().update_settings(new_settings)
         if self.state.template is not None and self.settings.microvolts != old_microvolts:
-            self.state.template = replace(self.state.template, attrs=self._signal_attrs())
+            old = self.state.template
+            dtype = np.float64 if self.settings.microvolts else np.int16
+            # A new dtype, so a new config_id; no data is lost, so no new segment.
+            self.state.template = _with_config_id(
+                replace(old, data=old.data.astype(dtype), attrs=self._signal_attrs()), *self._scaling()
+            )
+
+    def _scaling(self) -> tuple:
+        """A raw stream's per-channel ``(conversion, offset)``, folded into ``config_id``:
+        the layout digest leaves out ``attrs``, so a new scaling at the same dtype would
+        otherwise keep the id. Microvolt values are already scaled."""
+        if self.settings.microvolts:
+            return ()
+        return tuple(self.state.conversion.tolist()), tuple(self.state.conversion_offset.tolist())
 
     def _signal_attrs(self) -> dict:
         """Stream-level attrs for the current ``microvolts`` setting.
@@ -666,7 +690,7 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
         new_ch_ax = AxisArray.CoordinateAxis(data=ch_info, dims=["ch"], unit="struct")
         new_ch_ax.fingerprint
         old = self.state.template
-        self.state.template = replace(old, axes={**old.axes, "ch": new_ch_ax})
+        self.state.template = _with_config_id(replace(old, axes={**old.axes, "ch": new_ch_ax}), *self._scaling())
 
     async def _produce(self) -> AxisArray | None:
         st = self.state
@@ -857,7 +881,7 @@ class CereLinkSpikeProducer(_CereLinkBaseProducer[CereLinkSpikeSettings, CereLin
         ch_ax.fingerprint
         unit_ax.fingerprint
         template = AxisArray(
-            np.zeros((0, 0, 0), dtype=np.uint8),
+            np.zeros((0, n_ch, 7), dtype=np.uint8),
             dims=["time", "ch", "unit"],
             axes={"time": time_ax, "ch": ch_ax, "unit": unit_ax},
             key="SPIKES",
@@ -873,7 +897,7 @@ class CereLinkSpikeProducer(_CereLinkBaseProducer[CereLinkSpikeSettings, CereLin
         st.buffer = np.zeros((n_t, n_ch, 7), dtype=np.uint8)
         st.n_channels = n_ch
         st.n_t = n_t
-        st.template = template
+        st.template = _with_config_id(template)
         st.data_event = asyncio.Event()
         st.chid_to_buffer_idx = {ch_id: i for i, ch_id in enumerate(channels)}
         st.window_origin_ns = -1
@@ -933,7 +957,7 @@ class CereLinkSpikeProducer(_CereLinkBaseProducer[CereLinkSpikeSettings, CereLin
         new_ch_ax = AxisArray.CoordinateAxis(data=ch_info, dims=["ch"], unit="struct")
         new_ch_ax.fingerprint
         old = st.template
-        st.template = replace(old, axes={**old.axes, "ch": new_ch_ax})
+        st.template = _with_config_id(replace(old, axes={**old.axes, "ch": new_ch_ax}))
 
     async def _produce(self) -> AxisArray | None:
         st = self.state
@@ -982,7 +1006,7 @@ class CereLinkSpikeProducer(_CereLinkBaseProducer[CereLinkSpikeSettings, CereLin
 
         template = st.template
         new_time_ax = replace(template.axes["time"], offset=new_offset)
-        # Sparse spikes cannot show a gap; the segment only moves on when the device is reopened or remapped.
+        # Sparse spikes cannot show a gap; the segment only moves on when the device is reopened.
         return replace(template, data=out_data, axes={**template.axes, "time": new_time_ax}, segment=self._segment)
 
 

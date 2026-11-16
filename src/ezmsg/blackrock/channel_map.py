@@ -326,10 +326,6 @@ class ChannelMapProcessor(BaseStatefulTransformer[ChannelMapUnitSettings, AxisAr
             labels.extend(f"ch{i + 1}" for i in range(len(labels), n_total))
         return labels
 
-    def _hash_message(self, message: AxisArray) -> int:
-        ch_dim_idx = message.dims.index("ch")
-        return hash(message.data.shape[ch_dim_idx])
-
     def _process(self, message: AxisArray) -> AxisArray:
         return replace(message, axes={**message.axes, "ch": self.state.channel_axis})
 

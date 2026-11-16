@@ -10,6 +10,7 @@ from conftest import read_log, run_nplayserver
 from ezmsg.util.messagelogger import MessageLogger
 from ezmsg.util.terminate import TerminateOnTotal
 from pycbsdk import ChannelType, DeviceType, SampleRate
+from test_cerelink_config_id import expected_config_id
 
 from ezmsg.blackrock.cerelink import (
     CereLinkSignalSettings,
@@ -75,6 +76,8 @@ class TestCereLinkSignalSource:
             assert msg.attrs["offset"] == pytest.approx(0.0)
             assert msg.attrs["manufacturer"] == "CereLink"
             assert msg.attrs["device"] == "NPLAY"
+            assert msg.config_id == expected_config_id(msg) != 0
+        assert len({msg.config_id for msg in messages}) == 1
 
     def test_microvolts(self, nplayserver, tmp_path):
         n_ch = 3

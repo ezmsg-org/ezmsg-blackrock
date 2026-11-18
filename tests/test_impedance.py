@@ -2,7 +2,7 @@
 
 import numpy as np
 import pytest
-from ezmsg.util.messages.axisarray import AxisArray
+from ezmsg.util.messages.axisarray import AxisArray, replace
 
 from ezmsg.blackrock.cereplex_impedance import (
     CerePlexImpedanceProcessor,
@@ -316,6 +316,19 @@ class TestCerePlexImpedanceProcessor:
         assert len(proc.state.trackers) == 2
         assert proc.state.trackers[0].ch_start == 0 and proc.state.trackers[0].ch_end == 2
         assert proc.state.trackers[1].ch_start == 2 and proc.state.trackers[1].ch_end == N_CH
+
+    def test_segment_break_preserves_impedance(self):
+        """A new segment (gap / end-of-stream marker) must not clear measured values."""
+        data = self._build_sweep([50.0, 100.0, 200.0, 150.0])
+        proc = CerePlexImpedanceProcessor(settings=CerePlexImpedanceSettings(headstage_channel_offsets=(0,)))
+        chunk_size = int(0.01 * FS)
+        for i in range(0, data.shape[0], chunk_size):
+            proc(_make_axis_array(data[i : i + chunk_size], offset=i / FS))
+        before = proc.state.impedance.copy()
+        assert not np.isnan(before).any()
+
+        proc(replace(_make_axis_array(np.zeros((0, N_CH))), segment=1))
+        np.testing.assert_array_equal(proc.state.impedance, before)
 
     def test_non_safe_field_arms_reset(self):
         """A change to a field outside NONRESET_SETTINGS_FIELDS must queue a reset."""

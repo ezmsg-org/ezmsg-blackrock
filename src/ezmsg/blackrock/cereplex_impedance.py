@@ -237,6 +237,10 @@ class CerePlexImpedanceProcessor(
         s.impedance = np.full(n_ch, np.nan, dtype=np.float64)
         s.ch_axis = message.axes.get("ch")
 
+    def _reset_segment(self, message: AxisArray) -> None:
+        # A gap invalidates in-flight bursts, not impedances already measured.
+        self._build_trackers(self.state.impedance.shape[0])
+
     def _build_trackers(self, n_ch: int) -> None:
         """Build per-headstage trackers from the current settings.
 

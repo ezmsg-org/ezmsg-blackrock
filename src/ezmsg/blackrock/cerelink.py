@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+import math
 import threading
 import time
 import typing
@@ -157,6 +158,13 @@ class CereLinkSignalSettings(ez.Settings):
     ``Digitize`` uses and an ezmsg-lsl outlet publishes). ``attrs["unit"]`` is
     ``"uV"`` either way: it names the unit of the values, after conversion."""
 
+    compensate_filter_delay: bool = True
+    """Subtract the DC group delay of the low-pass filters in the signal path (the
+    analog front end of a hub, and the digital filter of any non-RAW group) from the
+    time axis, so each sample is stamped when its voltage occurred at the electrode.
+    The applied value, in seconds, is ``attrs["filter_delay"]`` when non-zero. The
+    fixed non-filter device latency is not part of this."""
+
     cont_buffer_dur: float = 0.5
     """Ring buffer duration in seconds."""
 
@@ -266,6 +274,21 @@ def _with_config_id(template: AxisArray, *parts) -> AxisArray:
     return replace(template, config_id=chain_config_id(config_id, *parts) if parts else config_id)
 
 
+def butterworth_dc_group_delay(order: int, fc_hz: float) -> float:
+    """DC group delay, in seconds, of an analog Butterworth low-pass: ``sum_k sin((2k-1)pi/2N) / (2 pi fc)``.
+    No low-pass (order or corner 0) has none."""
+    if order <= 0 or fc_hz <= 0:
+        return 0.0
+    return sum(math.sin((2 * k - 1) * math.pi / (2 * order)) for k in range(1, order + 1)) / (2 * math.pi * fc_hz)
+
+
+# Hub front end: 7.5 kHz 3rd-order Butterworth, from a step-response fit, not a device query.
+# An NSP's front-end corner (65-125 kHz) is negligible; nPlay replays data, so it has none of its own.
+_FRONT_END_DELAY = {
+    t: butterworth_dc_group_delay(3, 7500.0) for t in (DeviceType.HUB1, DeviceType.HUB2, DeviceType.HUB3)
+}
+
+
 def _per_channel_or_scalar(values: np.ndarray) -> float | np.ndarray:
     """A float when every channel shares the value, else a copy of the per-channel array.
 
@@ -291,6 +314,7 @@ class CereLinkSignalProducerState(_CereLinkSharedState):
     template: AxisArray | None = None
     conversion: np.ndarray | None = None  # float64 [n_ch], raw -> uV slope
     conversion_offset: np.ndarray | None = None  # float64 [n_ch], uV at raw 0 (not a time offset)
+    filter_delay: float = 0.0  # seconds subtracted from the time axis offset
     data_event: asyncio.Event | None = None  # set by callback when new samples arrive
 
 
@@ -600,6 +624,7 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
         st.n_channels = n_ch
         st.conversion = conversion
         st.conversion_offset = conversion_offset
+        st.filter_delay = self._compute_filter_delay(channels)
         st.template = _with_config_id(replace(template, attrs=self._signal_attrs()), *self._scaling())
         st.data_event = asyncio.Event()
 
@@ -623,9 +648,10 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
         """A raw stream's per-channel ``(conversion, offset)``, folded into ``config_id``:
         the layout digest leaves out ``attrs``, so a new scaling at the same dtype would
         otherwise keep the id. Microvolt values are already scaled."""
+        parts = (self.state.filter_delay,) if self.state.filter_delay else ()
         if self.settings.microvolts:
-            return ()
-        return tuple(self.state.conversion.tolist()), tuple(self.state.conversion_offset.tolist())
+            return parts
+        return (tuple(self.state.conversion.tolist()), tuple(self.state.conversion_offset.tolist())) + parts
 
     def _signal_attrs(self) -> dict:
         """Stream-level attrs for the current ``microvolts`` setting.
@@ -637,7 +663,26 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
         if not self.settings.microvolts:
             attrs["conversion"] = _per_channel_or_scalar(self.state.conversion)
             attrs["offset"] = _per_channel_or_scalar(self.state.conversion_offset)
+        if self.state.filter_delay:
+            attrs["filter_delay"] = self.state.filter_delay
         return attrs
+
+    def _compute_filter_delay(self, channels: list[int]) -> float:
+        """Seconds of low-pass group delay to subtract from the time axis (0 if not compensating)."""
+        if not self.settings.compensate_filter_delay:
+            return 0.0
+        delay = _FRONT_END_DELAY.get(self.settings.device_type, 0.0)
+        if self.settings.subscribe_rate != SampleRate.SR_RAW:  # RAW bypasses the digital filter
+            session = self.state.session
+            delays = set()
+            for ch_id in channels:
+                info = session.get_filter_info(session.get_channel_smpfilter(ch_id))
+                # mHz -> Hz
+                delays.add(butterworth_dc_group_delay(info["lporder"], info["lpfreq"] / 1000) if info else 0.0)
+            if len(delays) > 1:
+                logger.warning("CereLink: channels in the group have different filters; using the shortest delay")
+            delay += min(delays, default=0.0)
+        return delay
 
     def _compute_conversion(self, channels: list[int]) -> tuple[np.ndarray, np.ndarray]:
         """Per-channel ``(conversion, offset)`` with ``uV = raw * conversion + offset``."""
@@ -690,7 +735,10 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
         new_ch_ax = AxisArray.CoordinateAxis(data=ch_info, dims=["ch"], unit="struct")
         new_ch_ax.fingerprint
         old = self.state.template
-        self.state.template = _with_config_id(replace(old, axes={**old.axes, "ch": new_ch_ax}), *self._scaling())
+        self.state.filter_delay = self._compute_filter_delay(channels)
+        self.state.template = _with_config_id(
+            replace(old, axes={**old.axes, "ch": new_ch_ax}, attrs=self._signal_attrs()), *self._scaling()
+        )
 
     async def _produce(self) -> AxisArray | None:
         st = self.state
@@ -741,6 +789,7 @@ class CereLinkSignalProducer(_CereLinkBaseProducer[CereLinkSignalSettings, CereL
                     new_offset = offsets[0]
                 else:
                     new_offset = time.monotonic() - st.template.axes["time"].gain * len(out_dat)
+            new_offset -= st.filter_delay
 
             template = st.template
             new_time_ax = replace(template.axes["time"], offset=new_offset)

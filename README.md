@@ -111,6 +111,10 @@ However, if your intention is for the emulation PC to be a different machine tha
     * `inst` address terminates in `.128` to emulate Legacy NSP. See the list above for Gemini hardware. Also, Gemini hardware requires the instrument port to be set to `51002`.
     * `-L` uses the last `.nsX` file for replay. You can also manually specify an `.nsX` file for replay, but be aware nothing will replay when using `-L` if you've never replayed a file using nPlayServer, or if that file has moved or no longer exists.
 
+### Timestamps and filter delay
+
+`CereLinkSignalSource` subtracts the DC group delay of the low-pass filters in the signal path from each message's time-axis offset (`compensate_filter_delay=True`, the default): the hub analog front end (about 42 µs, a fitted 7.5 kHz 3rd-order Butterworth, not a device query) and, for non-RAW groups, the channel's digital low-pass filter. NSP RAW has none. **Behaviour change:** hub timestamps are now about 42 µs earlier than before; set `compensate_filter_delay=False` for the old values. The applied delay (seconds) is in `attrs["filter_delay"]` when non-zero. Fixed non-filter device latency is not included.
+
 ### Troubleshooting
 
 * When in doubt, restart equipment.
